@@ -26,8 +26,10 @@ from handlers.admin import (
     ban_user_callback,
     handle_ban_reason_input,
     queue_command,
+    resolve_command,
     retired_button_callback,
     stats_command,
+    stuck_command,
     unban_command,
     unban_user_callback,
     user_info_command,
@@ -95,6 +97,8 @@ def _register_handlers(application: Application) -> None:
         "addtag": add_tag_command,
         "addreason": add_reason_command,
         "userinfo": user_info_command,
+        "stuck": stuck_command,
+        "resolve": resolve_command,
     }
     for name, callback in commands.items():
         application.add_handler(CommandHandler(name, callback, filters=private))

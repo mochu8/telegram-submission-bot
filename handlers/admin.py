@@ -376,6 +376,67 @@ async def handle_ban_reason_input(update: Update, context: ContextTypes.DEFAULT_
 
 
 @admin_only
+async def stuck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出卡在发布中的投稿。"""
+    rows = db.list_publishing_submissions()
+    if not rows:
+        await update.message.reply_text("没有卡在发布中的投稿。")
+        return
+    lines = ["<b>发布中的投稿</b>", ""]
+    for sub in rows:
+        lines.append(
+            f"#{sub.id} 投稿人 <code>{sub.user_id}</code> "
+            f"审核人 <code>{sub.reviewer_id or '无'}</code>"
+        )
+    lines.append("")
+    lines.append("退回待审核：<code>/resolve 编号 pending</code>")
+    lines.append("确认已发出、不再发布：<code>/resolve 编号 approved</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """把卡在 publishing 的投稿退回待审核，或标成已通过且不再发送。"""
+    args = context.args or []
+    if len(args) != 2:
+        await update.message.reply_text(
+            "用法: <code>/resolve &lt;投稿编号&gt; pending|approved</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        submission_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 无效的投稿编号")
+        return
+    action = args[1].lower()
+    submission = db.get_submission(submission_id)
+    if submission is None:
+        await update.message.reply_text("❌ 投稿不存在")
+        return
+    if submission.status != "publishing":
+        await update.message.reply_text("❌ 只有状态为发布中的投稿可以这样处理")
+        return
+    actor_id = update.effective_user.id
+    if action == "pending":
+        ok = db.release_submission_claim(submission_id)
+        text = f"投稿 #{submission_id} 已退回待审核。请先确认频道里没有这条消息。"
+    elif action == "approved":
+        ok = db.finalize_approval(submission_id, actor_id, None, submission.published_msg_id)
+        text = (
+            f"投稿 #{submission_id} 已标成通过，不会再次发到频道。"
+            "如果频道里实际上没有这条消息，请不要用 approved。"
+        )
+    else:
+        await update.message.reply_text("❌ 第二个参数只能是 pending 或 approved")
+        return
+    if not ok:
+        await update.message.reply_text("❌ 处理失败，状态可能已经变了")
+        return
+    await update.message.reply_text(text)
+
+
+@admin_only
 async def retired_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """旧键盘上已删除的按钮。只提示，不执行任何写操作。"""
     await update.callback_query.answer("该按钮已停用，请使用最新消息上的按钮", show_alert=True)

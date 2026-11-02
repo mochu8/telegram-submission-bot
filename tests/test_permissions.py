@@ -253,6 +253,36 @@ def test_do_reject_blocks_non_admin(monkeypatch):
     assert fake.calls == []
 
 
+def test_resolve_command_recovers_publishing_rows(database, monkeypatch):
+    from config import config
+
+    monkeypatch.setattr(admin, "db", database)
+    monkeypatch.setattr("utils.auth.db", database)
+    monkeypatch.setitem(config._config, "admin_ids", [1])
+    database.get_or_create_user(3, "a", "A")
+    submission = database.create_submission(3, "text", text_content="stuck")
+    assert database.claim_submission(submission.id, 9) is True
+
+    async def run():
+        update = make_update(1, with_callback=False)
+        context = SimpleNamespace(args=[])
+        await admin.stuck_command(update, context)
+        assert str(submission.id) in update.message.replies[-1]
+
+        context.args = [str(submission.id), "pending"]
+        await admin.resolve_command(update, context)
+        assert database.get_submission(submission.id).status == "pending"
+
+        assert database.claim_submission(submission.id, 9) is True
+        context.args = [str(submission.id), "approved"]
+        await admin.resolve_command(update, context)
+        stored = database.get_submission(submission.id)
+        assert stored.status == "approved"
+        assert database.get_user_stats(3)["approved"] == 1
+
+    asyncio.run(run())
+
+
 def test_custom_reason_does_not_swallow_an_in_progress_submission(monkeypatch):
     monkeypatch.setattr(review, "is_operator", lambda user_id: True)
     called = []
