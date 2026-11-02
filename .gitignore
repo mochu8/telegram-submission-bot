@@ -14,8 +14,13 @@ __pycache__/
 
 # 虚拟环境
 venv/
+.venv/
 env/
 .env
+
+# 测试和检查缓存
+.pytest_cache/
+.ruff_cache/
 
 # IDE
 .idea/

@@ -28,6 +28,8 @@
 
 ## 📋 快速开始
 
+需要 Python >= 3.10。
+
 ### 1. 获取 Bot Token
 
 1. 在 Telegram 中找 [@BotFather](https://t.me/BotFather)
@@ -43,16 +45,32 @@
 
 ### 3. 配置机器人
 
-编辑 `config.json` 文件：
+复制示例配置后再填写，不要把真实 Token 提交到仓库：
+
+```bash
+cp config.example.json config.json
+```
+
+`config.json`：
 
 ```json
 {
-  "bot_token": "在这里填入你的 Bot Token",
-  "admin_ids": [123456789],  // 填入你的用户 ID
-  "channel_id": "@你的频道用户名",
-  ...
+  "bot_token": "123456:replace-with-the-token-from-botfather",
+  "admin_ids": [123456789],
+  "channel_id": "@your_channel",
+  "channel_name": "示例频道",
+  "database_path": "bot.db"
 }
 ```
+
+也可以不把 Token 写进文件，启动前设置环境变量。`BOT_TOKEN` 会覆盖配置文件里的 `bot_token`。`DATABASE_PATH` 会覆盖 `database_path`；相对路径按配置文件所在目录解析，并保存为绝对路径。
+
+```bash
+export BOT_TOKEN="123456:replace-with-the-token-from-botfather"
+export DATABASE_PATH="/var/lib/submission-bot/bot.db"
+```
+
+启动时会检查 Token 格式。机器人只处理私聊里的消息和按钮回调。
 
 ### 4. 安装依赖
 
@@ -70,29 +88,30 @@ python bot.py
 
 ```
 telegram-submission-bot/
-├── bot.py              # 主程序入口
-├── config.py           # 配置管理
-├── config.json         # 配置文件
-├── requirements.txt    # Python 依赖
+├── bot.py                 # 主程序入口
+├── config.py              # 配置管理
+├── config.example.json    # 配置示例（复制为 config.json）
+├── requirements.txt       # 运行依赖
+├── requirements-dev.txt   # 测试和检查依赖
+├── LICENSE
 │
 ├── database/
-│   ├── __init__.py
-│   ├── models.py       # 数据库模型
-│   └── db.py           # 数据库操作
+│   ├── models.py          # 数据库模型
+│   └── db.py              # 数据库操作
 │
 ├── handlers/
-│   ├── __init__.py
-│   ├── start.py        # /start 等命令
-│   ├── submission.py   # 投稿处理
-│   ├── review.py       # 审核处理
-│   └── admin.py        # 管理员命令
+│   ├── start.py           # /start 等命令
+│   ├── submission.py      # 投稿处理
+│   ├── review.py          # 审核处理
+│   └── admin.py           # 管理员命令
 │
 ├── utils/
-│   ├── __init__.py
-│   ├── keyboard.py     # 键盘生成
-│   └── helpers.py      # 辅助函数
+│   ├── auth.py            # 管理员校验
+│   ├── keyboard.py        # 键盘生成
+│   ├── helpers.py         # 辅助函数
+│   └── media.py           # 媒体发送
 │
-└── README.md
+└── tests/                 # pytest
 ```
 
 ## ⌨️ 命令列表
@@ -121,9 +140,10 @@ telegram-submission-bot/
 
 | 配置项 | 说明 |
 |--------|------|
-| `bot_token` | 从 BotFather 获取的 Token |
+| `bot_token` | 从 BotFather 获取的 Token。可被环境变量 `BOT_TOKEN` 覆盖 |
 | `admin_ids` | 管理员用户 ID 数组 |
 | `channel_id` | 发布投稿的频道 ID（@xxx 格式） |
+| `database_path` | SQLite 文件路径。可被环境变量 `DATABASE_PATH` 覆盖；相对路径会按配置文件目录转成绝对路径 |
 | `channel_name` | 频道显示名称 |
 | `navigation_links` | 导航链接配置 |
 | `customer_service` | 客服链接 |
@@ -153,6 +173,16 @@ A: 检查 `config.json` 中的 `admin_ids` 是否正确
 **Q: 如何添加多个管理员？**
 A: 在 `admin_ids` 数组中添加多个 ID，如 `[123, 456, 789]`
 
+## 开发
+
+Python >= 3.10。
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
+
 ## 📄 许可证
 
-MIT License
+MIT License。全文见 [LICENSE](LICENSE)。
