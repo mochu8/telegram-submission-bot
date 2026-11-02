@@ -7,13 +7,108 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
 from config import config
+from utils.media import clip_text
 from utils.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
 _USERNAME_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+_HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_URL_RE = re.compile(r"""https?://[^\s<>"']+""", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def visible_text(value: str | None) -> str:
+    """Text Telegram counts toward the 1024/4096 limits, without HTML tags."""
+    if not value:
+        return ""
+    if "<" not in value and "&" not in value:
+        return value
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        logger.warning("Could not parse HTML while measuring visible length", exc_info=True)
+        return _TAG_RE.sub("", html.unescape(value))
+    return "".join(parser.parts)
+
+
+def extract_urls(plain: str | None, html_text: str | None = None) -> list[str]:
+    """Collect link targets from Telegram HTML and from visible text."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: str) -> None:
+        cleaned = html.unescape(url).strip().rstrip(".,);]")
+        if not cleaned or cleaned in seen:
+            return
+        seen.add(cleaned)
+        found.append(cleaned)
+
+    for match in _HREF_RE.findall(html_text or ""):
+        add(match)
+    for match in _URL_RE.findall(plain or ""):
+        add(match)
+    for match in _URL_RE.findall(visible_text(html_text)):
+        add(match)
+    return found
+
+
+def format_review_body(text_content: str | None, text_html: str | None, limit: int = 3000) -> str:
+    """Review text that keeps original formatting and lists every URL in the clear."""
+    urls = extract_urls(text_content, text_html)
+    if text_html:
+        body = text_html
+    elif text_content:
+        body = escape_html(text_content)
+    else:
+        body = ""
+    if body and len(visible_text(body)) > limit:
+        preview = text_content or visible_text(text_html)
+        body = escape_html(truncate_text(preview, limit))
+    parts = []
+    if body:
+        parts.append("📝 内容：\n" + body)
+    if urls:
+        listed = "\n".join(escape_html(url) for url in urls)
+        parts.append("🔗 <b>链接（请核对后再通过）：</b>\n" + listed)
+    return "\n\n".join(parts)
+
+
+def format_review_caption(text_content: str | None, text_html: str | None, limit: int = 1024) -> str | None:
+    """Caption for reviewers. Hidden link targets stay visible even when the prose is clipped."""
+    urls = [url for url in extract_urls(text_content, text_html) if url not in (text_content or "")]
+    base = text_content or ""
+    prefix = "\n".join(urls)
+    if prefix and base:
+        combined = f"{prefix}\n{base}"
+    else:
+        combined = prefix or base
+    if not combined:
+        return None
+    if len(combined) <= limit:
+        return combined
+    if prefix and len(prefix) < limit and base:
+        room = limit - len(prefix) - 1
+        return f"{prefix}\n{base[:room]}".rstrip()
+    if len(prefix) >= limit:
+        head, _rest = clip_text(prefix, limit)
+        return head
+    head, _rest = clip_text(combined, limit)
+    return head
 
 
 def escape_html(text) -> str:
@@ -126,8 +221,8 @@ def build_submit_intro(include_hint: bool = False) -> str:
         "📝 <b>投稿须知</b>\n\n"
         f"{rules}\n\n"
         "请选择投稿方式：\n"
-        "• <b>实名投稿</b>：管理员可看到您的信息\n"
-        "• <b>匿名投稿</b>：完全匿名"
+        "• <b>实名投稿</b>：审核通知里会显示您的姓名和 ID\n"
+        "• <b>匿名投稿</b>：频道和审核界面不显示您的身份，记录仍会保留以便处理滥用"
         f"{hint}"
     )
 
@@ -147,7 +242,7 @@ def build_publish_bodies(text_content, text_html, tags, footer) -> tuple[str, st
     if text_content:
         plain_parts.append(text_content)
     elif text_html:
-        plain_parts.append(text_html)
+        plain_parts.append(visible_text(text_html))
 
     html_body = "".join(html_parts)
     plain_body = "".join(plain_parts)

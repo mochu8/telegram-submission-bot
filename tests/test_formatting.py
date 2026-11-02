@@ -1,7 +1,16 @@
 from types import SimpleNamespace
 
 import utils.helpers as helpers
-from utils.helpers import build_publish_bodies, escape_html, format_user_link
+from utils.helpers import (
+    build_publish_bodies,
+    build_submit_intro,
+    escape_html,
+    extract_urls,
+    format_review_body,
+    format_review_caption,
+    format_user_link,
+    visible_text,
+)
 from utils.keyboard import (
     build_admin_user_keyboard,
     build_reject_reasons_keyboard,
@@ -9,6 +18,48 @@ from utils.keyboard import (
     build_tags_keyboard,
 )
 from utils.media import clip_text, group_compatible, send_media_items
+
+
+def test_review_body_lists_hidden_link_targets():
+    html_text = '<a href="https://evil.example/phish">click here</a>'
+    urls = extract_urls("click here", html_text)
+    assert urls == ["https://evil.example/phish"]
+    body = format_review_body("click here", html_text)
+    assert "https://evil.example/phish" in body
+    assert "click here" in body
+    caption = format_review_caption("click here", html_text, limit=1024)
+    assert caption is not None
+    assert caption.startswith("https://evil.example/phish")
+
+
+def test_publish_limit_uses_visible_text_not_html_tags():
+    html_text = "<b>" + ("字" * 20) + "</b>"
+    _html_body, plain = build_publish_bodies(None, html_text, ["标签"], "")
+    assert "字" * 20 in plain
+    assert "<b>" not in plain
+    assert len(plain) < len(html_text) or "<b>" not in plain
+    assert visible_text(html_text) == "字" * 20
+    assert len(plain) <= 1024
+
+
+def test_remember_text_appends_instead_of_overwriting():
+    from handlers.submission import _remember_text
+
+    data = {}
+    assert _remember_text(data, "第一段", "第一段", has_media=False) == "saved"
+    assert _remember_text(data, "第二段", "<b>第二段</b>", has_media=False) == "appended"
+    assert data["text_content"] == "第一段\n第二段"
+    assert "第二段" in data["text_html"]
+    data["text_content"] = "x" * 1024
+    data["media_group"] = [{"type": "photo"}]
+    assert _remember_text(data, "更多", "更多", has_media=True) == "kept"
+    assert data["text_content"] == "x" * 1024
+
+
+def test_submit_intro_does_not_promise_full_anonymity():
+    text = build_submit_intro()
+    assert "完全匿名" not in text
+    assert "记录仍会保留" in text
 
 
 def test_user_content_is_html_escaped():

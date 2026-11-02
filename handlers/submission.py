@@ -15,10 +15,11 @@ from utils.helpers import (
     build_submit_intro,
     build_welcome_text,
     escape_html,
+    format_review_body,
+    format_review_caption,
     format_user_link,
     get_level_emoji,
     get_level_title,
-    truncate_text,
 )
 from utils.keyboard import (
     build_back_keyboard,
@@ -27,13 +28,7 @@ from utils.keyboard import (
     build_submit_options_keyboard,
     build_submitting_keyboard,
 )
-from utils.media import (
-    MAX_CAPTION_LENGTH,
-    MAX_MEDIA_ITEMS,
-    MAX_TEXT_LENGTH,
-    clip_text,
-    send_media_items,
-)
+from utils.media import MAX_CAPTION_LENGTH, MAX_MEDIA_ITEMS, MAX_TEXT_LENGTH, send_media_items
 from utils.state import clear_submission_draft, clear_user_flow_state
 from utils.users import submission_block_message, touch_user
 
@@ -44,14 +39,32 @@ STATE_CHOOSING_TYPE = "choosing_type"
 STATE_SUBMITTING = "submitting"
 
 
-def _remember_text(user_data: dict, plain: str | None, html_value: str | None) -> None:
+def _remember_text(user_data: dict, plain: str | None, html_value: str | None, *, has_media: bool) -> str:
+    """Append text. Returns saved, appended, or kept when the new text would exceed the limit."""
     if not plain:
-        return
-    user_data["text_content"] = plain
-    if html_value:
-        user_data["text_html"] = html_value
+        return "empty"
+    limit = MAX_CAPTION_LENGTH if has_media or user_data.get("media_group") else MAX_TEXT_LENGTH
+    existing = user_data.get("text_content") or ""
+    if not existing:
+        user_data["text_content"] = plain
+        if html_value:
+            user_data["text_html"] = html_value
+        else:
+            user_data.pop("text_html", None)
+        return "saved"
+    if plain == existing:
+        return "saved"
+    combined = f"{existing}\n{plain}"
+    if len(combined) > limit:
+        return "kept"
+    user_data["text_content"] = combined
+    previous_html = user_data.get("text_html")
+    addition = html_value or escape_html(plain)
+    if previous_html:
+        user_data["text_html"] = f"{previous_html}\n{addition}"
     else:
-        user_data.pop("text_html", None)
+        user_data["text_html"] = f"{escape_html(existing)}\n{addition}"
+    return "appended"
 
 
 async def start_submit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -151,19 +164,31 @@ async def handle_submission_content(update: Update, context: ContextTypes.DEFAUL
             )
             return
         media_group.append(media_item)
-        _remember_text(context.user_data, message.caption, message.caption_html)
-        if message.media_group_id:
+        remembered = _remember_text(
+            context.user_data,
+            message.caption,
+            message.caption_html,
+            has_media=True,
+        )
+        if message.media_group_id and remembered != "kept":
             return
+        note = _text_memory_note(remembered)
         await message.reply_text(
-            f"✅ 已收到 {len(media_group)} 个媒体文件\n\n继续发送更多内容，或点击「完成投稿」",
+            f"✅ 已收到 {len(media_group)} 个媒体文件{note}\n\n继续发送更多内容，或点击「完成投稿」",
             reply_markup=build_submitting_keyboard(),
         )
         return
 
     if message.text:
-        _remember_text(context.user_data, message.text, message.text_html)
+        remembered = _remember_text(
+            context.user_data,
+            message.text,
+            message.text_html,
+            has_media=False,
+        )
+        note = _text_memory_note(remembered)
         await message.reply_text(
-            "✅ 已收到文字内容\n\n可以继续发送图片/视频/音频/文件，或点击「完成投稿」",
+            f"✅ 已收到文字内容{note}\n\n可以继续发送图片/视频/音频/文件，或点击「完成投稿」",
             reply_markup=build_submitting_keyboard(),
         )
         return
@@ -172,6 +197,14 @@ async def handle_submission_content(update: Update, context: ContextTypes.DEFAUL
         "暂不支持这种消息类型。请发送文字、图片、视频、音频或文件。",
         reply_markup=build_submitting_keyboard(),
     )
+
+
+def _text_memory_note(remembered: str) -> str:
+    if remembered == "appended":
+        return "\n已把这段文字接到之前的内容后面。"
+    if remembered == "kept":
+        return "\n已保留之前的文字。加上这段后会超过长度限制，所以没有写入。"
+    return ""
 
 
 def extract_media_info(message) -> dict | None:
@@ -270,9 +303,9 @@ async def notify_admins_new_submission(context: ContextTypes.DEFAULT_TYPE, submi
         user_link = format_user_link(user.id, user.full_name or "用户", user.username)
         user_info = f"👤 投稿者: {user_link}\n🆔 用户ID: <code>{int(user.id)}</code>"
 
-    body = ""
-    if submission.text_content:
-        body = f"📝 内容：\n{escape_html(truncate_text(submission.text_content, 500))}\n\n"
+    body = format_review_body(submission.text_content, submission.text_html)
+    if body:
+        body += "\n\n"
 
     text = (
         f"📨 <b>新投稿 #{submission.id}</b>\n\n"
@@ -298,9 +331,11 @@ async def notify_admins_new_submission(context: ContextTypes.DEFAULT_TYPE, submi
                 media_types = json.loads(submission.media_types)
             else:
                 media_types = ["photo"] * len(media_ids)
-            caption = submission.text_content
-            if caption and len(caption) > MAX_CAPTION_LENGTH:
-                caption, _rest = clip_text(caption, MAX_CAPTION_LENGTH)
+            caption = format_review_caption(
+                submission.text_content,
+                submission.text_html,
+                MAX_CAPTION_LENGTH,
+            )
             await send_media_items(
                 context.bot,
                 admin_id,

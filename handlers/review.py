@@ -167,11 +167,12 @@ async def _publish_to_channel(context, submission, tags: list[str]) -> int | Non
     )
     has_media = bool(submission.media_ids) and submission.media_ids not in ("null", "[]")
     limit = MAX_CAPTION_LENGTH if has_media else MAX_TEXT_LENGTH
+    # Telegram counts visible characters, not the HTML tags around them.
     extra = None
-    if not html_text:
-        primary = None
-    elif len(html_text) <= limit:
-        primary = html_text
+    if not plain_text:
+        primary = html_text or None
+    elif len(plain_text) <= limit:
+        primary = html_text or escape_html(plain_text)
     else:
         head, rest = clip_text(plain_text, limit)
         primary = escape_html(head)
