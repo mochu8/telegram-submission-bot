@@ -329,6 +329,14 @@ async def handle_ban_reason_input(update: Update, context: ContextTypes.DEFAULT_
     if user is None or message is None or not is_operator(user.id):
         return False
 
+    if context.user_data.get("state") == "submitting":
+        pop_pending_input(context.user_data, "ban_reason")
+        await message.reply_text(
+            "你正在投稿，已取消未完成的封禁理由。这条消息会按投稿内容处理。\n"
+            "如需封禁，请先发送 /cancel 结束投稿。"
+        )
+        return False
+
     if not message.text or not message.text.strip():
         await message.reply_text("请发送文字理由，或发送 /cancel 取消")
         return True

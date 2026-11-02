@@ -253,6 +253,34 @@ def test_do_reject_blocks_non_admin(monkeypatch):
     assert fake.calls == []
 
 
+def test_custom_reason_does_not_swallow_an_in_progress_submission(monkeypatch):
+    monkeypatch.setattr(review, "is_operator", lambda user_id: True)
+    called = []
+
+    async def fake_commit(*args, **kwargs):
+        called.append(args)
+        return "ok"
+
+    monkeypatch.setattr(review, "commit_rejection", fake_commit)
+
+    async def run():
+        update = make_update(1, with_callback=False)
+        update.message.text = "我的投稿正文"
+        context = SimpleNamespace(
+            user_data={
+                "state": "submitting",
+                "pending_input": {"kind": "reject_reason", "submission_id": 5},
+            }
+        )
+        handled = await review.handle_custom_reason_input(update, context)
+        assert handled is False
+        assert called == []
+        assert "pending_input" not in context.user_data
+        assert any("投稿" in reply for reply in update.message.replies)
+
+    asyncio.run(run())
+
+
 def test_finish_and_type_callbacks_honor_bans(monkeypatch):
     monkeypatch.setattr(submission, "submission_block_message", lambda user: "BANNED")
     created = []

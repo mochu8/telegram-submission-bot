@@ -351,6 +351,10 @@ async def reject_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def custom_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """自定义拒绝理由"""
     query = update.callback_query
+    if context.user_data.get("state") == "submitting":
+        await query.answer("请先完成或 /cancel 自己的投稿，再填写拒绝理由", show_alert=True)
+        return
+
     await query.answer()
 
     submission_id = int(query.data.replace("custom_reason_", ""))
@@ -370,6 +374,14 @@ async def handle_custom_reason_input(update: Update, context: ContextTypes.DEFAU
     user = update.effective_user
     message = update.message
     if user is None or message is None or not is_operator(user.id):
+        return False
+
+    if context.user_data.get("state") == "submitting":
+        pop_pending_input(context.user_data, "reject_reason")
+        await message.reply_text(
+            "你正在投稿，已取消未完成的拒绝理由。这条消息会按投稿内容处理。\n"
+            "如需拒绝稿件，请先发送 /cancel 结束投稿。"
+        )
         return False
 
     if not message.text or not message.text.strip():
