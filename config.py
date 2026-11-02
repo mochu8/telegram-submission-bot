@@ -120,6 +120,56 @@ class Config:
             return path.resolve()
         return (self.config_path.resolve().parent / path).resolve()
 
+    def _int_setting(self, env_name: str, key: str, default: int) -> int:
+        raw = os.environ.get(env_name)
+        if raw is None or str(raw).strip() == "":
+            raw = self._config.get(key, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _bool_setting(self, env_name: str, key: str, default: bool) -> bool:
+        raw = os.environ.get(env_name)
+        if raw is None or str(raw).strip() == "":
+            raw = self._config.get(key, default)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @property
+    def max_pending_submissions(self) -> int:
+        """0 disables the cap. Default is 3 pending submissions per user."""
+        return max(0, self._int_setting("MAX_PENDING_SUBMISSIONS", "max_pending_submissions", 3))
+
+    @property
+    def submission_cooldown_seconds(self) -> int:
+        """0 disables the cooldown. Default is 60 seconds between submissions."""
+        return max(0, self._int_setting("SUBMISSION_COOLDOWN_SECONDS", "submission_cooldown_seconds", 60))
+
+    @property
+    def backup_enabled(self) -> bool:
+        return self._bool_setting("BACKUP_ENABLED", "backup_enabled", True)
+
+    @property
+    def backup_keep(self) -> int:
+        return max(1, self._int_setting("BACKUP_KEEP", "backup_keep", 7))
+
+    @property
+    def backup_hour_utc(self) -> int:
+        hour = self._int_setting("BACKUP_HOUR_UTC", "backup_hour_utc", 3)
+        return min(23, max(0, hour))
+
+    @property
+    def backup_dir(self) -> Path:
+        raw = os.environ.get("BACKUP_DIR") or self._config.get("backup_dir") or ""
+        if raw:
+            path = Path(str(raw)).expanduser()
+            if not path.is_absolute():
+                path = self.database_path.parent / path
+            return path.resolve()
+        return (self.database_path.parent / "backups").resolve()
+
     def is_config_admin(self, user_id: int) -> bool:
         """检查是否是配置文件中的管理员"""
         return user_id in self.admin_ids

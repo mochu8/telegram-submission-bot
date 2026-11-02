@@ -10,7 +10,8 @@ from telegram.ext import ContextTypes
 
 from config import config
 from database.db import db
-from utils.auth import admin_only, is_operator
+from utils.auth import admin_only, config_admin_only, full_admin_only, is_full_admin
+from utils.blocking import run_blocking
 from utils.helpers import escape_html, format_datetime, get_level_emoji, get_level_title
 from utils.keyboard import build_admin_user_keyboard, build_review_keyboard
 from utils.state import peek_pending_input, pop_pending_input, set_pending_input
@@ -34,8 +35,8 @@ async def _notify(bot, chat_id: int, text: str) -> None:
 @admin_only
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看待审核队列"""
-    pending_count = db.get_pending_count()
-    pending_submissions = db.get_pending_submissions(limit=5)
+    pending_count = await run_blocking(db.get_pending_count)
+    pending_submissions = await run_blocking(db.get_pending_submissions, limit=5)
 
     if not pending_submissions:
         await update.message.reply_text("✅ 当前没有待审核的投稿")
@@ -43,7 +44,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📋 <b>待审核队列</b> ({pending_count} 篇)", ""]
     for sub in pending_submissions:
-        user = db.get_user(sub.user_id)
+        user = await run_blocking(db.get_user, sub.user_id)
         if sub.is_anonymous:
             user_info = "匿名"
         elif user is not None and user.full_name:
@@ -66,7 +67,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看总体统计"""
-    stats = db.get_overall_stats()
+    stats = await run_blocking(db.get_overall_stats)
     if stats["total_submissions"] > 0:
         approval_rate = round(stats["approved"] / stats["total_submissions"] * 100, 1)
     else:
@@ -90,7 +91,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-@admin_only
+@full_admin_only
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """封禁用户"""
     args = context.args or []
@@ -108,15 +109,15 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reason = " ".join(args[1:]) if len(args) > 1 else None
-    if config.is_config_admin(target_id) or db.is_admin(target_id):
+    if config.is_config_admin(target_id) or await run_blocking(db.is_admin, target_id):
         await update.message.reply_text("❌ 不能封禁管理员")
         return
 
-    if not db.ban_user(target_id, update.effective_user.id, reason):
+    if not await run_blocking(db.ban_user, target_id, update.effective_user.id, reason):
         await update.message.reply_text("❌ 封禁失败，对方可能是管理员")
         return
 
-    target = db.get_user(target_id)
+        target = await run_blocking(db.get_user, target_id)
     await update.message.reply_text(
         (
             "🔒 <b>用户已封禁</b>\n\n"
@@ -137,7 +138,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only
+@full_admin_only
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """解封用户"""
     args = context.args or []
@@ -154,11 +155,11 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 无效的用户ID")
         return
 
-    if not db.unban_user(target_id, update.effective_user.id):
+    if not await run_blocking(db.unban_user, target_id, update.effective_user.id):
         await update.message.reply_text("❌ 解封失败，用户可能不存在")
         return
 
-    target = db.get_user(target_id)
+        target = await run_blocking(db.get_user, target_id)
     await update.message.reply_text(
         (
             "🔓 <b>用户已解封</b>\n\n"
@@ -174,7 +175,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only
+@full_admin_only
 async def add_tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加标签"""
     args = context.args or []
@@ -187,7 +188,7 @@ async def add_tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = args[0]
     emoji = args[1] if len(args) > 1 else None
-    tag = db.add_tag(name, emoji)
+    tag = await run_blocking(db.add_tag, name, emoji)
     if tag is None:
         await update.message.reply_text("❌ 标签已存在")
         return
@@ -202,7 +203,7 @@ async def add_tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only
+@full_admin_only
 async def add_reason_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加拒绝理由"""
     args = context.args or []
@@ -214,7 +215,7 @@ async def add_reason_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     text = " ".join(args)
-    db.add_reject_reason(text)
+    await run_blocking(db.add_reject_reason, text)
     await update.message.reply_text(
         f"✅ <b>拒绝理由已添加</b>\n\n📝 理由: {escape_html(text)}",
         parse_mode=ParseMode.HTML,
@@ -238,12 +239,12 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 无效的用户ID")
         return
 
-    user = db.get_user(target_id)
+    user = await run_blocking(db.get_user, target_id)
     if user is None:
         await update.message.reply_text("❌ 用户不存在")
         return
 
-    stats = db.get_user_stats(target_id)
+    stats = await run_blocking(db.get_user_stats, target_id)
     level = stats["level"]
     username = f"@{escape_html(user.username)}" if user.username else "无"
     text = (
@@ -271,12 +272,12 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only
+@full_admin_only
 async def ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """通过按钮封禁用户"""
     query = update.callback_query
     target_id = int(query.data.replace("ban_", ""))
-    if config.is_config_admin(target_id) or db.is_admin(target_id):
+    if config.is_config_admin(target_id) or await run_blocking(db.is_admin, target_id):
         await query.answer("不能封禁管理员", show_alert=True)
         return
 
@@ -291,18 +292,18 @@ async def ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only
+@full_admin_only
 async def unban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """通过按钮解封用户"""
     query = update.callback_query
     await query.answer()
 
     target_id = int(query.data.replace("unban_", ""))
-    if not db.unban_user(target_id, update.effective_user.id):
+    if not await run_blocking(db.unban_user, target_id, update.effective_user.id):
         await query.edit_message_text("❌ 解封失败")
         return
 
-    target = db.get_user(target_id)
+        target = await run_blocking(db.get_user, target_id)
     await query.edit_message_text(
         (
             "🔓 <b>用户已解封</b>\n\n"
@@ -326,7 +327,7 @@ async def handle_ban_reason_input(update: Update, context: ContextTypes.DEFAULT_
 
     user = update.effective_user
     message = update.message
-    if user is None or message is None or not is_operator(user.id):
+    if user is None or message is None or not await run_blocking(is_full_admin, user.id):
         return False
 
     if context.user_data.get("state") == "submitting":
@@ -343,17 +344,17 @@ async def handle_ban_reason_input(update: Update, context: ContextTypes.DEFAULT_
 
     reason = message.text.strip()
     target_id = int(pending["target_id"])
-    if config.is_config_admin(target_id) or db.is_admin(target_id):
+    if config.is_config_admin(target_id) or await run_blocking(db.is_admin, target_id):
         pop_pending_input(context.user_data, "ban_reason")
         await message.reply_text("❌ 不能封禁管理员")
         return True
 
     pop_pending_input(context.user_data, "ban_reason")
-    if not db.ban_user(target_id, user.id, reason):
+    if not await run_blocking(db.ban_user, target_id, user.id, reason):
         await message.reply_text("❌ 封禁失败")
         return True
 
-    target = db.get_user(target_id)
+        target = await run_blocking(db.get_user, target_id)
     await message.reply_text(
         (
             "🔒 <b>用户已封禁</b>\n\n"
@@ -375,10 +376,10 @@ async def handle_ban_reason_input(update: Update, context: ContextTypes.DEFAULT_
     return True
 
 
-@admin_only
+@full_admin_only
 async def stuck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """列出卡在发布中的投稿。"""
-    rows = db.list_publishing_submissions()
+    rows = await run_blocking(db.list_publishing_submissions)
     if not rows:
         await update.message.reply_text("没有卡在发布中的投稿。")
         return
@@ -394,7 +395,7 @@ async def stuck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-@admin_only
+@full_admin_only
 async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """把卡在 publishing 的投稿退回待审核，或标成已通过且不再发送。"""
     args = context.args or []
@@ -410,7 +411,7 @@ async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 无效的投稿编号")
         return
     action = args[1].lower()
-    submission = db.get_submission(submission_id)
+    submission = await run_blocking(db.get_submission, submission_id)
     if submission is None:
         await update.message.reply_text("❌ 投稿不存在")
         return
@@ -419,10 +420,12 @@ async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     actor_id = update.effective_user.id
     if action == "pending":
-        ok = db.release_submission_claim(submission_id)
+        ok = await run_blocking(db.release_submission_claim, submission_id)
         text = f"投稿 #{submission_id} 已退回待审核。请先确认频道里没有这条消息。"
     elif action == "approved":
-        ok = db.finalize_approval(submission_id, actor_id, None, submission.published_msg_id)
+        ok = await run_blocking(
+            db.finalize_approval, submission_id, actor_id, None, submission.published_msg_id
+        )
         text = (
             f"投稿 #{submission_id} 已标成通过，不会再次发到频道。"
             "如果频道里实际上没有这条消息，请不要用 approved。"
@@ -434,6 +437,48 @@ async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 处理失败，状态可能已经变了")
         return
     await update.message.reply_text(text)
+
+
+@config_admin_only
+async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """只有配置文件里的管理员可以授予或收回角色。"""
+    args = context.args or []
+    if len(args) != 2 or args[1].lower() not in {"reviewer", "admin", "user"}:
+        await update.message.reply_text(
+            "用法: <code>/setrole &lt;用户ID&gt; reviewer|admin|user</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 无效的用户ID")
+        return
+    role = args[1].lower()
+    if not await run_blocking(db.set_user_role, target_id, role):
+        await update.message.reply_text("❌ 设置角色失败")
+        return
+    await update.message.reply_text(
+        f"已将 <code>{target_id}</code> 的角色设为 <b>{escape_html(role)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@full_admin_only
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """立刻备份并把数据库文件发给管理员。"""
+    try:
+        path = await run_blocking(db.backup_database, config.backup_dir, config.backup_keep)
+    except Exception:
+        logger.exception("Manual backup failed")
+        await update.message.reply_text("❌ 备份失败，请查看日志")
+        return
+    with open(path, "rb") as handle:
+        await update.message.reply_document(
+            document=handle,
+            filename=path.name,
+            caption=f"数据库备份 {path.name}",
+        )
 
 
 @admin_only

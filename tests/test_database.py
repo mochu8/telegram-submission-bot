@@ -155,6 +155,63 @@ def test_parallel_claims_publish_once(database):
     assert database.get_submission(submission.id).status == STATUS_PUBLISHING
 
 
+def test_pending_cap_and_cooldown(database, monkeypatch):
+    monkeypatch.setenv("MAX_PENDING_SUBMISSIONS", "1")
+    monkeypatch.setenv("SUBMISSION_COOLDOWN_SECONDS", "0")
+    database.get_or_create_user(11, "a", "A")
+    database.create_submission(11, "text", text_content="one")
+    with pytest.raises(SubmissionNotAllowed, match="最多同时 1"):
+        database.create_submission(11, "text", text_content="two")
+
+    monkeypatch.setenv("MAX_PENDING_SUBMISSIONS", "0")
+    monkeypatch.setenv("SUBMISSION_COOLDOWN_SECONDS", "3600")
+    database.get_or_create_user(12, "b", "B")
+    database.create_submission(12, "text", text_content="one")
+    with pytest.raises(SubmissionNotAllowed, match="过于频繁"):
+        database.create_submission(12, "text", text_content="two")
+
+
+def test_backup_keeps_the_newest_files(database, tmp_path):
+    database.get_or_create_user(13, "a", "A")
+    database.create_submission(13, "text", text_content="kept")
+    first = database.backup_database(tmp_path, keep=2)
+    second = database.backup_database(tmp_path, keep=2)
+    third = database.backup_database(tmp_path, keep=2)
+    names = sorted(path.name for path in tmp_path.glob("bot-*.db"))
+    assert first.name not in names
+    assert second.name in names and third.name in names
+    import sqlite3
+
+    check = sqlite3.connect(third)
+    try:
+        count = check.execute("select count(*) from submissions").fetchone()[0]
+    finally:
+        check.close()
+    assert count == 1
+
+
+def test_touch_user_skips_unchanged_writes(database):
+    created = database.get_or_create_user(14, "same", "Same")
+    again = database.get_or_create_user(14, "same", "Same")
+    assert again.last_active == created.last_active
+    renamed = database.get_or_create_user(14, "other", "Same")
+    assert renamed.username == "other"
+
+
+def test_set_role_and_recipient_list(database, monkeypatch):
+    from config import config
+    from utils.auth import is_full_admin, is_operator, review_recipient_ids
+
+    monkeypatch.setattr("utils.auth.db", database)
+    monkeypatch.setitem(config._config, "admin_ids", [1])
+    assert database.set_user_role(20, "reviewer") is True
+    assert is_operator(20) is True
+    assert is_full_admin(20) is False
+    assert is_full_admin(1) is True
+    assert 20 in review_recipient_ids()
+    assert 1 in review_recipient_ids()
+
+
 def test_default_data_is_idempotent_and_reasons_use_ids(database):
     tags = [{"name": "分享", "emoji": "📢"}]
     database.init_default_data(tags, ["理由"])

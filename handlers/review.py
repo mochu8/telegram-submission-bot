@@ -12,6 +12,7 @@ from telegram.ext import ContextTypes
 from config import config
 from database.db import db
 from utils.auth import DENIED_TEXT, admin_only, is_operator
+from utils.blocking import run_blocking
 from utils.helpers import build_publish_bodies, escape_html
 from utils.keyboard import (
     build_reject_reasons_keyboard,
@@ -35,14 +36,14 @@ from utils.state import (
 logger = logging.getLogger(__name__)
 
 
-def _tag_names(tag_ids) -> list[str]:
+async def _tag_names(tag_ids) -> list[str]:
     ids = []
     for tag_id in tag_ids or []:
         try:
             ids.append(int(tag_id))
         except (TypeError, ValueError):
             continue
-    return [tag.name for tag in db.get_tags_by_ids(ids)]
+    return [tag.name for tag in await run_blocking(db.get_tags_by_ids, ids)]
 
 
 def _rejection_admin_text(submission_id: int, reason: str) -> str:
@@ -69,6 +70,47 @@ async def _answer_denied(query) -> None:
         logger.warning("Could not answer unauthorized callback", exc_info=True)
 
 
+async def _mark_review_handled(context, submission_id: int, actor, summary: str, skip=None) -> None:
+    """Edit the other admins' review messages once someone handles the submission."""
+    notices = await run_blocking(db.get_review_notices, submission_id)
+    if not notices:
+        return
+    name = escape_html(getattr(actor, "full_name", None) or getattr(actor, "id", "管理员"))
+    text = f"投稿 #{int(submission_id)} 已由 {name} 处理\n\n{summary}"
+    for notice in notices:
+        if skip and (notice.chat_id, notice.message_id) == skip:
+            continue
+        try:
+            await context.bot.edit_message_text(
+                chat_id=notice.chat_id,
+                message_id=notice.message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.warning(
+                "Could not update review notice %s/%s",
+                notice.chat_id,
+                notice.message_id,
+                exc_info=True,
+            )
+    await run_blocking(db.clear_review_notices, submission_id)
+
+
+def _current_review_message(update):
+    query = getattr(update, "callback_query", None)
+    message = getattr(query, "message", None) if query is not None else None
+    if message is None:
+        return None
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    return (chat_id, message_id)
+
+
 async def _notify_rejection(context, submission, submission_id: int, reason: str) -> None:
     try:
         await context.bot.send_message(
@@ -85,24 +127,31 @@ async def _notify_rejection(context, submission, submission_id: int, reason: str
         )
 
 
-async def commit_rejection(context, reviewer, submission_id: int, reason: str) -> str:
+async def commit_rejection(context, reviewer, submission_id: int, reason: str, skip=None) -> str:
     """Apply a rejection. Returns forbidden, missing, handled, or ok."""
-    if reviewer is None or not is_operator(reviewer.id):
+    if reviewer is None or not await run_blocking(is_operator, reviewer.id):
         logger.warning(
             "Blocked non-admin rejection of submission %s by %s",
             submission_id,
             getattr(reviewer, "id", None),
         )
         return "forbidden"
-    submission = db.get_submission(submission_id)
+    submission = await run_blocking(db.get_submission, submission_id)
     if submission is None:
         clear_review_state(context.user_data, submission_id)
         return "missing"
-    if not db.reject_submission(submission_id, reviewer.id, reason):
+    if not await run_blocking(db.reject_submission, submission_id, reviewer.id, reason):
         clear_review_state(context.user_data, submission_id)
         return "handled"
     clear_review_state(context.user_data, submission_id)
     await _notify_rejection(context, submission, submission_id, reason)
+    await _mark_review_handled(
+        context,
+        submission_id,
+        reviewer,
+        _rejection_admin_text(submission_id, reason),
+        skip=skip,
+    )
     return "ok"
 
 
@@ -116,7 +165,7 @@ async def approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = review_state(context.user_data, submission_id)
     state["selected_tag_ids"] = []
 
-    tags = db.get_all_tags()
+    tags = await run_blocking(db.get_all_tags)
     if tags:
         await query.edit_message_reply_markup(
             reply_markup=build_tags_keyboard(tags, submission_id, [])
@@ -143,7 +192,11 @@ async def tag_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         selected.append(tag_id)
 
     await query.edit_message_reply_markup(
-        reply_markup=build_tags_keyboard(db.get_all_tags(), submission_id, selected)
+        reply_markup=build_tags_keyboard(
+            await run_blocking(db.get_all_tags),
+            submission_id,
+            selected,
+        )
     )
 
 
@@ -225,7 +278,7 @@ async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user = update.effective_user
 
-    if user is None or not is_operator(user.id):
+    if user is None or not await run_blocking(is_operator, user.id):
         logger.warning(
             "Blocked non-admin publish of submission %s by %s",
             submission_id,
@@ -238,7 +291,7 @@ async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.warning("confirm_and_publish called without a callback query")
         return
 
-    submission = db.get_submission(submission_id)
+    submission = await run_blocking(db.get_submission, submission_id)
     if submission is None:
         clear_review_state(context.user_data, submission_id)
         await query.edit_message_text("❌ 投稿不存在")
@@ -248,17 +301,17 @@ async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ 未配置 channel_id，无法发布")
         return
 
-    if not db.claim_submission(submission_id, user.id):
+    if not await run_blocking(db.claim_submission, submission_id, user.id):
         clear_review_state(context.user_data, submission_id)
         await query.edit_message_text("❌ 该投稿已被处理")
         return
 
-    tags = _tag_names(tag_ids)
+    tags = await _tag_names(tag_ids)
     try:
         published_msg_id = await _publish_to_channel(context, submission, tags)
     except Exception as exc:
         logger.exception("Publishing submission %s failed", submission_id)
-        db.release_submission_claim(submission_id)
+        await run_blocking(db.release_submission_claim, submission_id)
         await query.edit_message_text(
             f"❌ 发布失败: {escape_html(str(exc))}",
             parse_mode=ParseMode.HTML,
@@ -267,11 +320,13 @@ async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if published_msg_id is None:
         logger.error("Channel publish of submission %s produced no message", submission_id)
-        db.release_submission_claim(submission_id)
+        await run_blocking(db.release_submission_claim, submission_id)
         await query.edit_message_text("❌ 发布失败: 频道没有返回消息")
         return
 
-    if not db.finalize_approval(submission_id, user.id, tags, published_msg_id):
+    if not await run_blocking(
+        db.finalize_approval, submission_id, user.id, tags, published_msg_id
+    ):
         logger.error(
             "Published submission %s as message %s but failed to mark it approved",
             submission_id,
@@ -281,7 +336,7 @@ async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if tags:
-        db.increment_tag_usage(tags)
+        await run_blocking(db.increment_tag_usage, tags)
     clear_review_state(context.user_data, submission_id)
 
     await query.edit_message_text(
@@ -309,6 +364,13 @@ async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE
             submission_id,
             exc_info=True,
         )
+    await _mark_review_handled(
+        context,
+        submission_id,
+        user,
+        f"投稿 #{submission_id} 已通过并发布",
+        skip=_current_review_message(update),
+    )
 
 
 @admin_only
@@ -318,11 +380,11 @@ async def reject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     submission_id = int(query.data.replace("reject_", ""))
-    reasons = db.get_all_reject_reasons()
+    reasons = await run_blocking(db.get_all_reject_reasons)
     if not reasons:
         for text in config.default_reject_reasons:
-            db.add_reject_reason(text)
-        reasons = db.get_all_reject_reasons()
+            await run_blocking(db.add_reject_reason, text)
+        reasons = await run_blocking(db.get_all_reject_reasons)
 
     await query.edit_message_reply_markup(
         reply_markup=build_reject_reasons_keyboard(reasons, submission_id)
@@ -337,14 +399,14 @@ async def reject_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
     submission_id = int(submission_raw)
     reason_id = int(reason_raw)
 
-    reason = db.get_reject_reason(reason_id)
+    reason = await run_blocking(db.get_reject_reason, reason_id)
     if reason is None:
         await query.answer("理由不存在", show_alert=True)
         return
 
     await query.answer()
     if await do_reject(update, context, submission_id, reason.text):
-        db.increment_reason_usage(reason.id)
+        await run_blocking(db.increment_reason_usage, reason.id)
 
 
 @admin_only
@@ -373,7 +435,7 @@ async def handle_custom_reason_input(update: Update, context: ContextTypes.DEFAU
 
     user = update.effective_user
     message = update.message
-    if user is None or message is None or not is_operator(user.id):
+    if user is None or message is None or not await run_blocking(is_operator, user.id):
         return False
 
     if context.user_data.get("state") == "submitting":
@@ -409,7 +471,13 @@ async def do_reject(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     submission_id: int, reason: str):
     """执行拒绝操作，并再次确认调用者是管理员。"""
     query = update.callback_query
-    result = await commit_rejection(context, update.effective_user, submission_id, reason)
+    result = await commit_rejection(
+        context,
+        update.effective_user,
+        submission_id,
+        reason,
+        skip=_current_review_message(update),
+    )
     if result == "forbidden":
         await _answer_denied(query)
         return False

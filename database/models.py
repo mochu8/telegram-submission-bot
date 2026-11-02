@@ -112,6 +112,24 @@ class RejectReason(Base):
         return f"<RejectReason(id={self.id}, text={self.text[:20]}...)>"
 
 
+class ReviewNotice(Base):
+    """发给管理员的审核消息，处理后用来改掉其他人的按钮。"""
+
+    __tablename__ = "review_notices"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    submission_id = Column(Integer, ForeignKey("submissions.id"), nullable=False, index=True)
+    chat_id = Column(Integer, nullable=False)
+    message_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+    def __repr__(self):
+        return (
+            f"<ReviewNotice(submission_id={self.submission_id}, "
+            f"chat_id={self.chat_id}, message_id={self.message_id})>"
+        )
+
+
 class BanRecord(Base):
     """封禁记录表"""
 

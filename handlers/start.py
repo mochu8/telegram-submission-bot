@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 
 from config import config
 from utils.auth import is_operator
+from utils.blocking import run_blocking
 from utils.helpers import build_welcome_text
 from utils.keyboard import build_main_keyboard
 from utils.state import clear_user_flow_state
@@ -16,7 +17,7 @@ from utils.users import touch_user
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /start 命令"""
-    touch_user(update.effective_user)
+    await run_blocking(touch_user, update.effective_user)
     clear_user_flow_state(context.user_data)
 
     await update.message.reply_text(
@@ -32,13 +33,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /help 命令"""
-    touch_user(update.effective_user)
+    await run_blocking(touch_user, update.effective_user)
     help_text = (
         "🤖 <b>机器人使用帮助</b>\n\n"
         "<b>普通用户命令：</b>\n"
         "/start - 启动机器人，显示主菜单\n"
         "/submit - 开始投稿\n"
         "/mystats - 查看我的投稿统计\n"
+        "/my - 查看我的投稿和状态\n"
         "/cancel - 取消当前操作\n"
         "/help - 显示帮助信息\n\n"
         "<b>投稿说明：</b>\n"
@@ -51,16 +53,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 违规投稿可能导致封禁"
     )
 
-    if is_operator(update.effective_user.id):
+    if await run_blocking(is_operator, update.effective_user.id):
         help_text += (
             "\n\n<b>管理员命令：</b>\n"
             "/queue - 查看待审核队列\n"
             "/stats - 查看总体统计\n"
+            "/stuck - 查看卡在发布中的投稿\n"
+            "/resolve &lt;编号&gt; pending|approved - 处理卡住的投稿\n"
             "/ban &lt;用户ID&gt; &lt;原因&gt; - 封禁用户\n"
             "/unban &lt;用户ID&gt; - 解封用户\n"
             "/userinfo &lt;用户ID&gt; - 查看用户信息\n"
             "/addtag &lt;名称&gt; &lt;emoji&gt; - 添加标签\n"
-            "/addreason &lt;理由&gt; - 添加拒绝理由"
+            "/addreason &lt;理由&gt; - 添加拒绝理由\n"
+            "/backup - 备份并发送数据库\n"
+            "/setrole &lt;用户ID&gt; reviewer|admin|user - 仅配置管理员可用"
         )
 
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
@@ -68,6 +74,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /cancel 命令"""
-    touch_user(update.effective_user)
+    await run_blocking(touch_user, update.effective_user)
     clear_user_flow_state(context.user_data)
     await update.message.reply_text("✅ 已取消当前操作\n\n发送 /start 返回主菜单")

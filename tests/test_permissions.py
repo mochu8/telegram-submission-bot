@@ -193,6 +193,12 @@ class FakeDB:
     def increment_tag_usage(self, names):
         self.calls.append(("tags", tuple(names)))
 
+    def get_review_notices(self, submission_id):
+        return []
+
+    def clear_review_notices(self, submission_id):
+        return None
+
 
 def test_publish_is_admin_gated_and_rolls_back(monkeypatch):
     from config import config
@@ -407,6 +413,67 @@ def test_media_limit_and_audio_are_enforced(monkeypatch):
         assert any("1024" in reply for reply in long_caption.message.replies)
 
     asyncio.run(run())
+
+
+def test_error_alert_is_rate_limited(monkeypatch):
+    import bot as bot_module
+    from config import config
+
+    monkeypatch.setattr(bot_module, "_last_error_alert", 0.0)
+    monkeypatch.setitem(config._config, "admin_ids", [7])
+    sent = []
+
+    class Bot:
+        async def send_message(self, **kwargs):
+            sent.append(kwargs)
+
+    context = SimpleNamespace(error=RuntimeError("boom"), bot=Bot())
+
+    async def run():
+        await bot_module.on_error(None, context)
+        await bot_module.on_error(None, context)
+
+    asyncio.run(run())
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == 7
+    assert "boom" in sent[0]["text"]
+
+
+def test_my_lists_statuses_and_review_notices_are_closed(database, monkeypatch):
+    from config import config
+
+    monkeypatch.setattr(submission, "db", database)
+    monkeypatch.setattr(review, "db", database)
+    monkeypatch.setattr("utils.users.db", database)
+    monkeypatch.setitem(config._config, "admin_ids", [1])
+    database.get_or_create_user(30, "me", "Me")
+    created = database.create_submission(30, "text", text_content="hello", is_anonymous=True)
+    database.add_review_notice(created.id, 1, 10)
+    database.add_review_notice(created.id, 2, 11)
+    edited = []
+
+    class Bot:
+        async def edit_message_text(self, **kwargs):
+            edited.append(kwargs)
+
+    async def run():
+        update = make_update(30, with_callback=False)
+        await submission.my_submissions_command(update, SimpleNamespace(user_data={}))
+        assert "待审核" in update.message.replies[-1]
+        assert "匿名" in update.message.replies[-1]
+        await review._mark_review_handled(
+            SimpleNamespace(bot=Bot()),
+            created.id,
+            SimpleNamespace(id=1, full_name="Ada"),
+            "已通过",
+            skip=(1, 10),
+        )
+
+    asyncio.run(run())
+    assert len(edited) == 1
+    assert edited[0]["chat_id"] == 2
+    assert "Ada" in edited[0]["text"]
+    assert database.get_review_notices(created.id) == []
 
 
 def test_handlers_are_private_and_updates_are_narrow():

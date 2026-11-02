@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, func, select, text, update
+from sqlalchemy import create_engine, delete, event, func, select, text, update
 from sqlalchemy.orm import sessionmaker
 
 from config import config
@@ -18,6 +18,7 @@ from database.models import (
     BanRecord,
     Base,
     RejectReason,
+    ReviewNotice,
     Submission,
     Tag,
     User,
@@ -87,13 +88,29 @@ class Database:
         """获取或创建用户。不会改动封禁状态。"""
         with self.get_session() as session:
             user = session.get(User, user_id)
+            now = utcnow()
             if user is None:
-                user = User(id=user_id, username=username, full_name=full_name)
+                user = User(
+                    id=user_id,
+                    username=username,
+                    full_name=full_name,
+                    last_active=now,
+                )
                 session.add(user)
-            else:
+                session.commit()
+                session.refresh(user)
+                return self._detach(session, user)
+
+            profile_changed = user.username != username or user.full_name != full_name
+            last_active = user.last_active
+            stale = last_active is None or (now - last_active).total_seconds() >= 300
+            if not profile_changed and not stale:
+                return self._detach(session, user)
+
+            if profile_changed:
                 user.username = username
                 user.full_name = full_name
-                user.last_active = utcnow()
+            user.last_active = now
             session.commit()
             session.refresh(user)
             return self._detach(session, user)
@@ -174,6 +191,30 @@ class Database:
             user = session.get(User, user_id)
             return bool(user and user.role in ("admin", "reviewer"))
 
+    def has_admin_role(self, user_id: int) -> bool:
+        """True only for role=admin, not for reviewers."""
+        with self.get_session() as session:
+            user = session.get(User, user_id)
+            return bool(user and user.role == "admin")
+
+    def list_user_ids_by_roles(self, roles: tuple[str, ...]) -> list[int]:
+        with self.get_session() as session:
+            stmt = select(User.id).where(User.role.in_(roles))
+            return [int(item) for item in session.execute(stmt).scalars().all()]
+
+    def set_user_role(self, user_id: int, role: str) -> bool:
+        if role not in {"user", "reviewer", "admin"}:
+            return False
+        with self.get_session() as session:
+            user = session.get(User, user_id)
+            if user is None:
+                user = User(id=user_id, role=role)
+                session.add(user)
+            else:
+                user.role = role
+            session.commit()
+            return True
+
     def get_user_stats(self, user_id: int):
         """获取用户统计"""
         with self.get_session() as session:
@@ -207,6 +248,9 @@ class Database:
             user = session.get(User, user_id)
             if user is None or user.is_banned:
                 raise SubmissionNotAllowed(f"user {user_id} cannot submit")
+            limited = self._submission_limit_reason(session, user_id)
+            if limited:
+                raise SubmissionNotAllowed(limited)
             submission = Submission(
                 user_id=user_id,
                 content_type=content_type,
@@ -222,6 +266,44 @@ class Database:
             session.commit()
             session.refresh(submission)
             return self._detach(session, submission)
+
+    def _submission_limit_reason(self, session, user_id: int) -> str | None:
+        cap = config.max_pending_submissions
+        if cap > 0:
+            pending = session.execute(
+                select(func.count(Submission.id)).where(
+                    Submission.user_id == user_id,
+                    Submission.status == STATUS_PENDING,
+                )
+            ).scalar() or 0
+            if pending >= cap:
+                return (
+                    f"你还有 {pending} 篇投稿正在审核，最多同时 {cap} 篇。"
+                    "请等待审核后再提交。"
+                )
+        cooldown = config.submission_cooldown_seconds
+        if cooldown > 0:
+            last = session.execute(
+                select(func.max(Submission.created_at)).where(Submission.user_id == user_id)
+            ).scalar()
+            if last is not None:
+                remaining = cooldown - (utcnow() - last).total_seconds()
+                if remaining > 0:
+                    return f"投稿过于频繁，请在 {max(1, int(remaining))} 秒后再试。"
+        return None
+
+    def get_user_submissions(self, user_id: int, limit: int = 10) -> list:
+        with self.get_session() as session:
+            stmt = (
+                select(Submission)
+                .where(Submission.user_id == user_id)
+                .order_by(Submission.created_at.desc())
+                .limit(limit)
+            )
+            rows = list(session.execute(stmt).scalars().all())
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     def get_submission(self, submission_id: int):
         """获取投稿"""
@@ -469,6 +551,53 @@ class Database:
                 "approved": _count(STATUS_APPROVED),
                 "rejected": _count(STATUS_REJECTED),
             }
+
+    def add_review_notice(self, submission_id: int, chat_id: int, message_id: int) -> None:
+        with self.get_session() as session:
+            session.add(
+                ReviewNotice(
+                    submission_id=submission_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            )
+            session.commit()
+
+    def get_review_notices(self, submission_id: int) -> list:
+        with self.get_session() as session:
+            stmt = select(ReviewNotice).where(ReviewNotice.submission_id == submission_id)
+            rows = list(session.execute(stmt).scalars().all())
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def clear_review_notices(self, submission_id: int) -> None:
+        with self.get_session() as session:
+            session.execute(delete(ReviewNotice).where(ReviewNotice.submission_id == submission_id))
+            session.commit()
+
+    def backup_database(self, directory: str | Path, keep: int = 7) -> Path:
+        """Copy the live database with SQLite's backup API and keep the newest files."""
+        if not self.db_path:
+            raise RuntimeError("数据库尚未配置")
+        import sqlite3
+
+        target_dir = Path(directory)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest = target_dir / f"bot-{utcnow().strftime('%Y%m%d-%H%M%S-%f')}.db"
+        source = sqlite3.connect(self.db_path)
+        try:
+            copied = sqlite3.connect(dest)
+            try:
+                source.backup(copied)
+            finally:
+                copied.close()
+        finally:
+            source.close()
+        files = sorted(target_dir.glob("bot-*.db"), key=lambda path: path.name, reverse=True)
+        for old in files[max(1, keep):]:
+            old.unlink(missing_ok=True)
+        return dest
 
     def init_default_data(self, tags: list, reject_reasons: list):
         """初始化默认数据"""

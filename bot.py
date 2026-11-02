@@ -5,7 +5,9 @@ Telegram 投稿机器人
 功能：导航 + 投稿 + 审核 + 用户管理
 """
 
+import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -22,12 +24,14 @@ from database.db import db
 from handlers.admin import (
     add_reason_command,
     add_tag_command,
+    backup_command,
     ban_command,
     ban_user_callback,
     handle_ban_reason_input,
     queue_command,
     resolve_command,
     retired_button_callback,
+    set_role_command,
     stats_command,
     stuck_command,
     unban_command,
@@ -51,6 +55,7 @@ from handlers.submission import (
     finish_submit_callback,
     handle_submission_content,
     my_stats_command,
+    my_submissions_command,
     placeholder_callback,
     start_submit_callback,
     submit_command,
@@ -78,8 +83,63 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_submission_content(update, context)
 
 
+_last_error_alert = 0.0
+ERROR_ALERT_INTERVAL = 60.0
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("处理更新时出现未捕获的异常", exc_info=context.error)
+    global _last_error_alert
+    admins = config.admin_ids
+    if not admins or context is None or getattr(context, "bot", None) is None:
+        return
+    import time
+
+    now = time.monotonic()
+    if now - _last_error_alert < ERROR_ALERT_INTERVAL:
+        return
+    _last_error_alert = now
+    error = context.error
+    summary = f"{type(error).__name__}: {error}" if error else "unknown error"
+    from utils.helpers import escape_html
+
+    text = (
+        "⚠️ <b>机器人捕获到未处理异常</b>\n"
+        f"<code>{escape_html(summary[:500])}</code>"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=admins[0],
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.warning("无法把异常摘要发给管理员", exc_info=True)
+
+
+def _seconds_until_hour(hour_utc: int) -> float:
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=hour_utc, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _backup_loop() -> None:
+    while True:
+        await asyncio.sleep(_seconds_until_hour(config.backup_hour_utc))
+        if not config.backup_enabled:
+            continue
+        try:
+            path = await asyncio.to_thread(db.backup_database, config.backup_dir, config.backup_keep)
+            logger.info("已备份数据库到 %s", path)
+        except Exception:
+            logger.exception("定时备份失败")
+
+
+async def _post_init(application) -> None:
+    if config.backup_enabled:
+        application.bot_data["backup_task"] = asyncio.create_task(_backup_loop())
 
 
 def _register_handlers(application: Application) -> None:
@@ -90,6 +150,7 @@ def _register_handlers(application: Application) -> None:
         "cancel": cancel_command,
         "submit": submit_command,
         "mystats": my_stats_command,
+        "my": my_submissions_command,
         "queue": queue_command,
         "stats": stats_command,
         "ban": ban_command,
@@ -99,6 +160,8 @@ def _register_handlers(application: Application) -> None:
         "userinfo": user_info_command,
         "stuck": stuck_command,
         "resolve": resolve_command,
+        "setrole": set_role_command,
+        "backup": backup_command,
     }
     for name, callback in commands.items():
         application.add_handler(CommandHandler(name, callback, filters=private))
@@ -163,7 +226,7 @@ def main() -> int:
         len(db.get_all_tags()),
     )
 
-    application = Application.builder().token(config.bot_token).build()
+    application = Application.builder().token(config.bot_token).post_init(_post_init).build()
     _register_handlers(application)
     application.run_polling(allowed_updates=ALLOWED_UPDATES)
     return 0

@@ -11,6 +11,8 @@ from telegram.ext import ContextTypes
 
 from config import config
 from database.db import SubmissionNotAllowed, db
+from utils.auth import review_recipient_ids
+from utils.blocking import run_blocking
 from utils.helpers import (
     build_submit_intro,
     build_welcome_text,
@@ -70,7 +72,7 @@ def _remember_text(user_data: dict, plain: str | None, html_value: str | None, *
 async def start_submit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """开始投稿 - 选择投稿类型"""
     query = update.callback_query
-    blocked = submission_block_message(update.effective_user)
+    blocked = await run_blocking(submission_block_message, update.effective_user)
     await query.answer()
     if blocked:
         await query.edit_message_text(blocked)
@@ -87,7 +89,7 @@ async def submit_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     """选择投稿类型（实名/匿名）"""
     query = update.callback_query
     user = update.effective_user
-    blocked = submission_block_message(user)
+    blocked = await run_blocking(submission_block_message, user)
     await query.answer()
     if blocked:
         await query.edit_message_text(blocked)
@@ -124,7 +126,7 @@ async def handle_submission_content(update: Update, context: ContextTypes.DEFAUL
     if user is None or message is None:
         return
 
-    blocked = submission_block_message(user)
+    blocked = await run_blocking(submission_block_message, user)
     if blocked:
         clear_submission_draft(context.user_data)
         await message.reply_text(blocked)
@@ -224,7 +226,7 @@ async def finish_submit_callback(update: Update, context: ContextTypes.DEFAULT_T
     """完成投稿"""
     query = update.callback_query
     user = update.effective_user
-    blocked = submission_block_message(user)
+    blocked = await run_blocking(submission_block_message, user)
     if blocked:
         clear_submission_draft(context.user_data)
         await query.answer()
@@ -260,7 +262,8 @@ async def finish_submit_callback(update: Update, context: ContextTypes.DEFAULT_T
         content_type = "text"
 
     try:
-        submission = db.create_submission(
+        submission = await run_blocking(
+            db.create_submission,
             user_id=user.id,
             content_type=content_type,
             text_content=text_content,
@@ -269,11 +272,13 @@ async def finish_submit_callback(update: Update, context: ContextTypes.DEFAULT_T
             media_types=[item["type"] for item in media_group] or None,
             is_anonymous=is_anonymous,
         )
-    except SubmissionNotAllowed:
-        logger.info("Refused to store a submission for user %s", user.id)
+    except SubmissionNotAllowed as exc:
+        logger.info("Refused to store a submission for user %s: %s", user.id, exc)
         clear_submission_draft(context.user_data)
-        blocked = submission_block_message(user) or "请先发送 /start 后再投稿"
-        await query.edit_message_text(blocked)
+        detail = str(exc)
+        if detail.startswith("user "):
+            detail = await run_blocking(submission_block_message, user) or "请先发送 /start 后再投稿"
+        await query.edit_message_text(detail)
         return
 
     clear_submission_draft(context.user_data)
@@ -293,7 +298,7 @@ async def finish_submit_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def notify_admins_new_submission(context: ContextTypes.DEFAULT_TYPE, submission, user):
     """通知管理员有新投稿"""
-    admin_ids = config.admin_ids
+    admin_ids = review_recipient_ids()
     if not admin_ids:
         return
 
@@ -318,12 +323,14 @@ async def notify_admins_new_submission(context: ContextTypes.DEFAULT_TYPE, submi
 
     for admin_id in admin_ids:
         try:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=admin_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_review_keyboard(submission.id),
             )
+            if sent is not None:
+                await run_blocking(db.add_review_notice, submission.id, admin_id, sent.message_id)
             if not submission.media_ids:
                 continue
             media_ids = json.loads(submission.media_ids)
@@ -356,7 +363,7 @@ async def back_to_main_callback(update: Update, context: ContextTypes.DEFAULT_TY
                                 answer_text: str | None = None):
     """返回主菜单"""
     query = update.callback_query
-    touch_user(update.effective_user)
+    await run_blocking(touch_user, update.effective_user)
     clear_user_flow_state(context.user_data)
     if query is None:
         return
@@ -375,13 +382,13 @@ async def back_to_main_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def placeholder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """占位按钮点击"""
-    touch_user(update.effective_user)
+    await run_blocking(touch_user, update.effective_user)
     await update.callback_query.answer("该功能正在筹建中，敬请期待！", show_alert=True)
 
 
 async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /submit 命令"""
-    blocked = submission_block_message(update.effective_user)
+    blocked = await run_blocking(submission_block_message, update.effective_user)
     if blocked:
         await update.message.reply_text(blocked)
         return
@@ -393,11 +400,34 @@ async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def my_submissions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看自己的投稿和状态。"""
+    user = update.effective_user
+    await run_blocking(touch_user, user)
+    rows = await run_blocking(db.get_user_submissions, user.id, limit=10)
+    if not rows:
+        await update.message.reply_text("你还没有投稿。")
+        return
+    status_name = {
+        "pending": "待审核",
+        "publishing": "发布中",
+        "approved": "已通过",
+        "rejected": "已拒绝",
+    }
+    lines = ["<b>我的投稿</b>", ""]
+    for sub in rows:
+        kind = "匿名" if sub.is_anonymous else "实名"
+        lines.append(
+            f"#{sub.id} {status_name.get(sub.status, escape_html(sub.status))} · {kind}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def my_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看我的投稿统计"""
     user = update.effective_user
-    touch_user(user)
-    stats = db.get_user_stats(user.id)
+    await run_blocking(touch_user, user)
+    stats = await run_blocking(db.get_user_stats, user.id)
     if not stats:
         await update.message.reply_text("📊 您还没有投稿记录")
         return
