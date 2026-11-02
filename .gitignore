@@ -3,6 +3,9 @@ config.json
 
 # 数据库文件
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
 

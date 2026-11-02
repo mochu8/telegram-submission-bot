@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 import handlers.admin as admin
 import handlers.review as review
@@ -55,29 +55,52 @@ def make_update(user_id, data="", with_callback=True):
     )
 
 
-ADMIN_CALLBACKS = [
-    review.approve_callback,
-    review.reject_callback,
-    review.tag_select_callback,
-    review.confirm_tags_callback,
-    review.reject_reason_callback,
-    review.custom_reason_callback,
-    review.back_to_review_callback,
-    admin.ban_user_callback,
-    admin.unban_user_callback,
-    admin.retired_button_callback,
-]
+PUBLIC_CALLBACK_PATTERNS = {
+    "^placeholder$",
+    "^start_submit$",
+    "^submit_(named|anonymous)$",
+    "^finish_submit$",
+    "^cancel_submit$",
+    "^back_to_main$",
+}
+PUBLIC_COMMANDS = {"start", "help", "cancel", "submit", "mystats", "my"}
 
 
-def test_review_callbacks_reject_non_admins(monkeypatch):
-    monkeypatch.setattr("utils.auth.is_operator", lambda user_id: False)
+def test_registered_privileged_handlers_reject_non_admins(monkeypatch):
+    import utils.auth as auth
+
+    monkeypatch.setattr(auth, "is_operator", lambda user_id: False)
+    for name in ("is_full_admin", "is_config_operator"):
+        if hasattr(auth, name):
+            monkeypatch.setattr(auth, name, lambda user_id: False)
+
+    application = Application.builder().token("123456:" + "A" * 35).build()
+    _register_handlers(application)
+    callbacks = []
+    commands = []
+    for group in application.handlers.values():
+        for handler in group:
+            if isinstance(handler, CallbackQueryHandler):
+                pattern = getattr(handler.pattern, "pattern", str(handler.pattern))
+                if pattern not in PUBLIC_CALLBACK_PATTERNS:
+                    callbacks.append(handler.callback)
+            elif isinstance(handler, CommandHandler) and not (set(handler.commands) & PUBLIC_COMMANDS):
+                commands.append(handler.callback)
+
+    assert len(callbacks) >= 8
+    assert commands
 
     async def run():
-        for callback in ADMIN_CALLBACKS:
+        for callback in callbacks:
             update = make_update(4, data="approve_1")
-            await callback(update, SimpleNamespace(user_data={}))
-            assert update.callback_query.alerts, callback.__name__
-            assert "权限" in update.callback_query.alerts[0]["text"]
+            await callback(update, SimpleNamespace(user_data={}, args=[]))
+            assert update.callback_query.alerts, getattr(callback, "__name__", callback)
+            assert "权限" in (update.callback_query.alerts[0]["text"] or "")
+        for callback in commands:
+            update = make_update(4, with_callback=False)
+            await callback(update, SimpleNamespace(user_data={}, args=[]))
+            assert update.message.replies, getattr(callback, "__name__", callback)
+            assert "权限" in update.message.replies[-1]
 
     asyncio.run(run())
 
