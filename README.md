@@ -59,6 +59,12 @@ cp config.example.json config.json
 | `channel_id` | 发布频道，如 `@your_channel`。机器人必须是该频道管理员 |
 | `channel_name` | 通知投稿者时显示的频道名称 |
 | `database_path` | SQLite 文件路径 |
+| `max_pending_submissions` | 每人待审核上限，默认 3，`0` 为不限制 |
+| `submission_cooldown_seconds` | 两次投稿的最短间隔，默认 60 秒，`0` 为不限制 |
+| `backup_enabled` | 是否每天自动备份，默认开启。环境变量 `BACKUP_ENABLED` |
+| `backup_keep` | 保留最近几份备份，默认 7 |
+| `backup_hour_utc` | 每天备份的 UTC 小时，默认 3 |
+| `backup_dir` | 备份目录。未设置时在数据库旁边的 `backups/`。环境变量 `BACKUP_DIR` |
 | `bot_info.name` | `/start` 欢迎语中的机器人名称 |
 | `navigation_links` | 主菜单链接。`enabled: false` 时显示占位按钮 |
 | `customer_service` | 主菜单上的客服链接 |
@@ -90,6 +96,7 @@ python bot.py
 | `/start` | 主菜单，并登记用户 |
 | `/submit` | 开始投稿 |
 | `/mystats` | 查看自己的投稿统计和等级 |
+| `/my` | 查看最近投稿和状态 |
 | `/cancel` | 取消当前投稿草稿或待输入的封禁/拒绝理由 |
 | `/help` | 帮助。管理员会多看到管理命令 |
 
@@ -97,15 +104,26 @@ python bot.py
 
 | 命令 | 说明 |
 |------|------|
-| `/queue` | 待审核队列，并给出第一篇的通过/拒绝按钮 |
-| `/stats` | 用户数、投稿数、通过率和处于「发布中」的数量 |
-| `/ban <用户ID> [理由]` | 封禁。对方还没用过机器人时也会建档并封禁 |
+| `/queue` | 待审核队列，并给出第一篇的通过/拒绝按钮。审核员可用 |
+| `/stats` | 用户数、投稿数、通过率和处于「发布中」的数量。审核员可用 |
+| `/stuck` | 列出卡在「发布中」的投稿。仅管理员 |
+| `/resolve <编号> pending` | 退回待审核。仅管理员 |
+| `/resolve <编号> approved` | 标成已通过且不再发送。仅管理员 |
+| `/backup` | 立刻备份数据库并把文件发到当前私聊。仅管理员 |
+| `/setrole <用户ID> reviewer\|admin\|user` | 设置数据库角色。只有 `admin_ids` 里的人能用 |
+| `/ban <用户ID> [理由]` | 封禁。对方还没用过机器人时也会建档并封禁。仅管理员 |
 | `/unban <用户ID>` | 解封 |
 | `/userinfo <用户ID>` | 查看资料、统计，并可按钮封禁或解封 |
-| `/addtag <名称> [emoji]` | 添加标签 |
-| `/addreason <理由>` | 添加拒绝理由 |
+| `/addtag <名称> [emoji]` | 添加标签。仅管理员 |
+| `/addreason <理由>` | 添加拒绝理由。仅管理员 |
 
 配置中的管理员，以及数据库角色为 `admin` 或 `reviewer` 的用户，不能被封禁。
+
+审核员（`reviewer`）可以审核和查看队列。封禁、标签、拒绝理由、备份和 `/resolve` 只给配置管理员，以及数据库角色为 `admin` 的用户。新投稿会通知 `admin_ids`，也会通知数据库里的管理员和审核员。
+
+同一篇投稿被一位管理员处理后，其他管理员收到的审核消息会改成「已由某人处理」，并去掉按钮。
+
+每位用户默认最多 3 篇待审核投稿，两次投稿至少间隔 60 秒。把 `max_pending_submissions` 或 `submission_cooldown_seconds` 设为 `0` 可关闭对应限制，也可用环境变量 `MAX_PENDING_SUBMISSIONS` 和 `SUBMISSION_COOLDOWN_SECONDS` 覆盖。
 
 ## 审核流程
 
@@ -141,7 +159,8 @@ python bot.py
 
 ## 安全
 
-- **审核权限**：通过、选标签、确认发布、拒绝、预设理由、自定义理由、返回审核，以及封禁和解封，都会先确认管理员。发布和拒绝在写数据库前再查一次。
+- **审核权限**：通过、选标签、确认发布、拒绝、预设理由、自定义理由和返回审核，审核员也可以做。封禁、标签、备份和恢复卡住的稿件只允许管理员。发布和拒绝在写数据库前再查一次。
+- **审核可见性**：审核通知保留投稿里的链接格式，并单独列出每一个 URL，避免「点这里」把真实地址藏起来。
 - **封禁**：选择投稿方式、接收内容、写入投稿之前都会检查。封禁用户即使还留着旧按钮也不能提交。`create_submission` 对未登记或已封禁用户直接拒绝写入。
 - **避免重复发布**：通过时先用条件更新把状态从 `pending` 改成 `publishing`，只有一次更新会成功。频道发送失败会退回 `pending`。发送成功才改成 `approved`，并通过数只加一次。拒绝同样只对仍是 `pending` 的稿件生效。
 - **消息格式**：姓名、正文、拒绝和封禁理由等用户内容以 HTML 发送并转义，避免破坏消息格式。
@@ -152,25 +171,25 @@ python bot.py
 
 进程在占用稿件之后、写完最终状态之前退出时，该行会停在 `publishing`。`/stats` 里会出现「发布中」。程序不会在启动时自动改回 `pending`，因为频道里可能已经有这条消息，自动退回会造成再发一次。
 
-先到频道确认结果，再用 `sqlite3` 打开配置里的数据库。下面的 `123` 换成投稿编号。
+管理员先看 `/stuck`，再到频道核对，然后：
 
-频道里没有这条稿件时，退回待审核：
-
-```sql
-UPDATE submissions
-SET status = 'pending', reviewer_id = NULL, reviewed_at = NULL
-WHERE id = 123 AND status = 'publishing';
-```
-
-频道里已经有消息时，标成已通过并记下消息 ID，避免再次发布。这条手工更新不会补记用户的通过数：
-
-```sql
-UPDATE submissions
-SET status = 'approved', published_msg_id = 456
-WHERE id = 123 AND status = 'publishing';
-```
+- 频道里没有这条稿件：`/resolve 编号 pending`，退回待审核。
+- 频道里已经有消息：`/resolve 编号 approved`。这会记一次通过，并且不会再发。
 
 若一次发布分成多段，前一段已经成功、后一段失败，状态会退回 `pending`，重试可能把前一段再发一遍。同时点「通过」不会这样：第二个人拿不到这行。
+
+### 备份与部署
+
+每天按 `backup_hour_utc`（默认 UTC 3 点）用 SQLite 的 backup API 写一份数据库副本，只保留最近 `backup_keep` 份（默认 7）。`/backup` 会再做一份并把文件发到私聊。
+
+Docker 把数据库放在卷里：
+
+```bash
+export BOT_TOKEN="123456:replace-with-the-token-from-botfather"
+docker compose up -d --build
+```
+
+`docker-compose.yml` 使用卷 `/data`，`DATABASE_PATH=/data/bot.db`。systemd 示例在 `deploy/telegram-submission-bot.service`。Token 和数据库路径放在 `/etc/telegram-submission-bot.env`，不要写进 unit 文件。
 
 ## 等级
 
@@ -209,6 +228,8 @@ Dependabot（`.github/dependabot.yml`）每周检查 pip 依赖和 GitHub Action
 **管理员收不到新投稿。** 核对 `admin_ids`。该用户需要先私聊机器人。
 
 **有人还没 `/start` 就想封禁。** `/ban <用户ID> [理由]` 会先建立用户再封禁。
+
+**审核时看不到「点这里」后面的网址。** 审核通知会保留原有链接格式，并在下面列出全部 URL。
 
 ## 许可证
 
