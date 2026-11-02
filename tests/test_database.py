@@ -103,6 +103,30 @@ def test_claim_publish_and_reject_are_single_winners(database):
     assert database.get_user_stats(3)["rejected"] == 1
 
 
+def test_status_transitions_do_not_require_returning(database):
+    import inspect
+
+    from database.db import Database
+
+    for name in (
+        "claim_submission",
+        "release_submission_claim",
+        "finalize_approval",
+        "reject_submission",
+    ):
+        source = inspect.getsource(getattr(Database, name))
+        assert ".returning(" not in source
+    helper = inspect.getsource(Database._execute_conditional)
+    assert "changes()" in helper
+
+    database.get_or_create_user(6, "a", "A")
+    submission = database.create_submission(6, "text", text_content="old-sqlite")
+    assert database.claim_submission(submission.id, 1) is True
+    assert database.claim_submission(submission.id, 2) is False
+    assert database.finalize_approval(submission.id, 1, None, 9) is True
+    assert database.get_user_stats(6)["approved"] == 1
+
+
 def test_parallel_claims_publish_once(database):
     database.get_or_create_user(4, "a", "A")
     submission = database.create_submission(4, "text", text_content="race")

@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, func, select, update
+from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.orm import sessionmaker
 
 from config import config
@@ -248,24 +248,30 @@ class Database:
             stmt = select(func.count(Submission.id)).where(Submission.status == STATUS_PENDING)
             return session.execute(stmt).scalar() or 0
 
+    def _execute_conditional(self, session, statement) -> bool:
+        """Apply one conditional UPDATE and report whether this connection changed a row.
+
+        ``changes()`` works on SQLite older than 3.35. The WHERE clause keeps the
+        claim atomic: two callers cannot both update the same pending row.
+        """
+        session.execute(statement, execution_options={"synchronize_session": False})
+        changed = session.execute(text("SELECT changes()")).scalar()
+        return int(changed or 0) == 1
+
     def claim_submission(self, submission_id: int, reviewer_id: int) -> bool:
         """原子地把 pending 改为 publishing。同时通过时只有一个调用会成功。"""
         with self.get_session() as session:
-            row = session.execute(
+            changed = self._execute_conditional(
+                session,
                 update(Submission)
-                .where(
-                    Submission.id == submission_id,
-                    Submission.status == STATUS_PENDING,
-                )
+                .where(Submission.id == submission_id, Submission.status == STATUS_PENDING)
                 .values(
                     status=STATUS_PUBLISHING,
                     reviewer_id=reviewer_id,
                     reviewed_at=utcnow(),
-                )
-                .returning(Submission.id),
-                execution_options={"synchronize_session": False},
-            ).first()
-            if row is None:
+                ),
+            )
+            if not changed:
                 session.rollback()
                 return False
             session.commit()
@@ -274,21 +280,31 @@ class Database:
     def release_submission_claim(self, submission_id: int) -> bool:
         """发布失败时把 publishing 退回 pending，避免卡死或重复发布。"""
         with self.get_session() as session:
-            row = session.execute(
+            changed = self._execute_conditional(
+                session,
                 update(Submission)
-                .where(
-                    Submission.id == submission_id,
-                    Submission.status == STATUS_PUBLISHING,
-                )
-                .values(status=STATUS_PENDING, reviewer_id=None, reviewed_at=None)
-                .returning(Submission.id),
-                execution_options={"synchronize_session": False},
-            ).first()
-            if row is None:
+                .where(Submission.id == submission_id, Submission.status == STATUS_PUBLISHING)
+                .values(status=STATUS_PENDING, reviewer_id=None, reviewed_at=None),
+            )
+            if not changed:
                 session.rollback()
                 return False
             session.commit()
             return True
+
+    def list_publishing_submissions(self, limit: int = 20) -> list:
+        """列出卡在发布中的投稿。"""
+        with self.get_session() as session:
+            stmt = (
+                select(Submission)
+                .where(Submission.status == STATUS_PUBLISHING)
+                .order_by(Submission.reviewed_at.asc())
+                .limit(limit)
+            )
+            rows = list(session.execute(stmt).scalars().all())
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     def finalize_approval(
         self,
@@ -299,23 +315,19 @@ class Database:
     ) -> bool:
         """在发布成功后把 publishing 改为 approved，并只增加一次通过计数。"""
         with self.get_session() as session:
-            row = session.execute(
+            changed = self._execute_conditional(
+                session,
                 update(Submission)
-                .where(
-                    Submission.id == submission_id,
-                    Submission.status == STATUS_PUBLISHING,
-                )
+                .where(Submission.id == submission_id, Submission.status == STATUS_PUBLISHING)
                 .values(
                     status=STATUS_APPROVED,
                     reviewer_id=reviewer_id,
                     reviewed_at=utcnow(),
                     tags=json.dumps(tags) if tags else None,
                     published_msg_id=published_msg_id,
-                )
-                .returning(Submission.id),
-                execution_options={"synchronize_session": False},
-            ).first()
-            if row is None:
+                ),
+            )
+            if not changed:
                 session.rollback()
                 return False
             submission = session.get(Submission, submission_id)
@@ -329,22 +341,18 @@ class Database:
     def reject_submission(self, submission_id: int, reviewer_id: int, reason: str = None) -> bool:
         """拒绝投稿。只有当前仍是 pending 时才会成功。"""
         with self.get_session() as session:
-            row = session.execute(
+            changed = self._execute_conditional(
+                session,
                 update(Submission)
-                .where(
-                    Submission.id == submission_id,
-                    Submission.status == STATUS_PENDING,
-                )
+                .where(Submission.id == submission_id, Submission.status == STATUS_PENDING)
                 .values(
                     status=STATUS_REJECTED,
                     reviewer_id=reviewer_id,
                     reviewed_at=utcnow(),
                     reject_reason=reason,
-                )
-                .returning(Submission.id),
-                execution_options={"synchronize_session": False},
-            ).first()
-            if row is None:
+                ),
+            )
+            if not changed:
                 session.rollback()
                 return False
             submission = session.get(Submission, submission_id)
