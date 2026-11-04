@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATABASE_PATH: /data/bot.db
+      BACKUP_DIR: /data/backups
+    volumes:
+      - bot-data:/data
+
+volumes:
+  bot-data:

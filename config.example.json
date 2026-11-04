@@ -1,0 +1,51 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN_HERE",
+  "admin_ids": [123456789],
+  "channel_id": "@your_channel",
+  "channel_name": "示例频道",
+  "database_path": "bot.db",
+  "max_pending_submissions": 3,
+  "submission_cooldown_seconds": 60,
+  "backup_enabled": true,
+  "backup_keep": 7,
+  "backup_hour_utc": 3,
+  "bot_info": {
+    "name": "投稿机器人"
+  },
+  "navigation_links": [
+    {
+      "name": "示例导航",
+      "username": "example",
+      "enabled": true
+    },
+    {
+      "name": "筹建中",
+      "enabled": false,
+      "placeholder_text": "筹建中"
+    }
+  ],
+  "customer_service": {
+    "name": "联系客服",
+    "username": "example_support"
+  },
+  "submission_rules": "请确保内容真实、合法，并与频道主题相关。",
+  "footer": {
+    "enabled": false,
+    "links": [
+      {
+        "name": "频道",
+        "username": "your_channel",
+        "enabled": true
+      }
+    ]
+  },
+  "default_tags": [
+    {"name": "分享", "emoji": "📢"},
+    {"name": "提问", "emoji": "❓"}
+  ],
+  "default_reject_reasons": [
+    "内容与频道主题不符",
+    "信息不完整",
+    "包含广告或垃圾信息"
+  ]
+}

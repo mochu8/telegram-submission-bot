@@ -1,399 +1,505 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-审核处理器
-"""
+"""审核处理器"""
 
 import json
-from telegram import Update, InputMediaPhoto, InputMediaVideo
-from telegram.ext import ContextTypes
-from telegram.constants import ParseMode
+import logging
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import ContextTypes
 
 from config import config
 from database.db import db
+from utils.auth import DENIED_TEXT, admin_only, is_operator
+from utils.blocking import run_blocking
+from utils.helpers import build_publish_bodies, escape_html
 from utils.keyboard import (
-    build_review_keyboard, build_tags_keyboard,
-    build_reject_reasons_keyboard, build_confirm_publish_keyboard
+    build_reject_reasons_keyboard,
+    build_review_keyboard,
+    build_tags_keyboard,
 )
-from utils.helpers import format_submission_info, format_user_link
+from utils.media import (
+    MAX_CAPTION_LENGTH,
+    MAX_TEXT_LENGTH,
+    clip_text,
+    send_media_items,
+)
+from utils.state import (
+    clear_review_state,
+    peek_pending_input,
+    pop_pending_input,
+    review_state,
+    set_pending_input,
+)
+
+logger = logging.getLogger(__name__)
 
 
+async def _tag_names(tag_ids) -> list[str]:
+    ids = []
+    for tag_id in tag_ids or []:
+        try:
+            ids.append(int(tag_id))
+        except (TypeError, ValueError):
+            continue
+    return [tag.name for tag in await run_blocking(db.get_tags_by_ids, ids)]
+
+
+def _rejection_admin_text(submission_id: int, reason: str) -> str:
+    return (
+        f"❌ <b>投稿 #{int(submission_id)} 已拒绝</b>\n\n"
+        f"📝 理由: {escape_html(reason)}"
+    )
+
+
+def _rejection_user_text(submission_id: int, reason: str) -> str:
+    return (
+        f"😔 <b>您的投稿 #{int(submission_id)} 未通过审核</b>\n\n"
+        f"📝 原因: {escape_html(reason)}\n\n"
+        "您可以根据反馈修改后重新投稿。"
+    )
+
+
+async def _answer_denied(query) -> None:
+    if query is None:
+        return
+    try:
+        await query.answer(DENIED_TEXT, show_alert=True)
+    except Exception:
+        logger.warning("Could not answer unauthorized callback", exc_info=True)
+
+
+async def _mark_review_handled(context, submission_id: int, actor, summary: str, skip=None) -> None:
+    """Edit the other admins' review messages once someone handles the submission."""
+    notices = await run_blocking(db.get_review_notices, submission_id)
+    if not notices:
+        return
+    name = escape_html(getattr(actor, "full_name", None) or getattr(actor, "id", "管理员"))
+    text = f"投稿 #{int(submission_id)} 已由 {name} 处理\n\n{summary}"
+    for notice in notices:
+        if skip and (notice.chat_id, notice.message_id) == skip:
+            continue
+        try:
+            await context.bot.edit_message_text(
+                chat_id=notice.chat_id,
+                message_id=notice.message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.warning(
+                "Could not update review notice %s/%s",
+                notice.chat_id,
+                notice.message_id,
+                exc_info=True,
+            )
+    await run_blocking(db.clear_review_notices, submission_id)
+
+
+def _current_review_message(update):
+    query = getattr(update, "callback_query", None)
+    message = getattr(query, "message", None) if query is not None else None
+    if message is None:
+        return None
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    return (chat_id, message_id)
+
+
+async def _notify_rejection(context, submission, submission_id: int, reason: str) -> None:
+    try:
+        await context.bot.send_message(
+            chat_id=submission.user_id,
+            text=_rejection_user_text(submission_id, reason),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to notify submitter %s about rejection of %s",
+            submission.user_id,
+            submission_id,
+            exc_info=True,
+        )
+
+
+async def commit_rejection(context, reviewer, submission_id: int, reason: str, skip=None) -> str:
+    """Apply a rejection. Returns forbidden, missing, handled, or ok."""
+    if reviewer is None or not await run_blocking(is_operator, reviewer.id):
+        logger.warning(
+            "Blocked non-admin rejection of submission %s by %s",
+            submission_id,
+            getattr(reviewer, "id", None),
+        )
+        return "forbidden"
+    submission = await run_blocking(db.get_submission, submission_id)
+    if submission is None:
+        clear_review_state(context.user_data, submission_id)
+        return "missing"
+    if not await run_blocking(db.reject_submission, submission_id, reviewer.id, reason):
+        clear_review_state(context.user_data, submission_id)
+        return "handled"
+    clear_review_state(context.user_data, submission_id)
+    await _notify_rejection(context, submission, submission_id, reason)
+    await _mark_review_handled(
+        context,
+        submission_id,
+        reviewer,
+        _rejection_admin_text(submission_id, reason),
+        skip=skip,
+    )
+    return "ok"
+
+
+@admin_only
 async def approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """通过投稿"""
     query = update.callback_query
-    user = update.effective_user
-    
-    # 检查权限
-    if not config.is_config_admin(user.id) and not db.is_admin(user.id):
-        await query.answer("❌ 您没有权限执行此操作", show_alert=True)
-        return
-    
     await query.answer()
-    
-    # 解析投稿ID
+
     submission_id = int(query.data.replace("approve_", ""))
-    
-    # 存储投稿ID，等待选择标签
-    context.user_data['reviewing_submission_id'] = submission_id
-    context.user_data['selected_tags'] = []
-    
-    # 显示标签选择
-    tags = db.get_all_tags()
+    state = review_state(context.user_data, submission_id)
+    state["selected_tag_ids"] = []
+
+    tags = await run_blocking(db.get_all_tags)
     if tags:
         await query.edit_message_reply_markup(
             reply_markup=build_tags_keyboard(tags, submission_id, [])
         )
-    else:
-        # 没有标签，直接发布
-        await confirm_and_publish(update, context, submission_id, [])
+        return
+    await confirm_and_publish(update, context, submission_id, [])
 
 
+@admin_only
 async def tag_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """选择标签"""
     query = update.callback_query
     await query.answer()
-    
-    # 解析数据：tag_submissionId_tagName
-    parts = query.data.split("_", 2)
-    submission_id = int(parts[1])
-    tag_name = parts[2]
-    
-    # 切换标签选中状态
-    selected = context.user_data.get('selected_tags', [])
-    if tag_name in selected:
-        selected.remove(tag_name)
+
+    _prefix, submission_raw, tag_raw = query.data.split("_")
+    submission_id = int(submission_raw)
+    tag_id = int(tag_raw)
+
+    state = review_state(context.user_data, submission_id)
+    selected = state["selected_tag_ids"]
+    if tag_id in selected:
+        selected.remove(tag_id)
     else:
-        selected.append(tag_name)
-    context.user_data['selected_tags'] = selected
-    
-    # 更新键盘显示
-    tags = db.get_all_tags()
+        selected.append(tag_id)
+
     await query.edit_message_reply_markup(
-        reply_markup=build_tags_keyboard(tags, submission_id, selected)
+        reply_markup=build_tags_keyboard(
+            await run_blocking(db.get_all_tags),
+            submission_id,
+            selected,
+        )
     )
 
 
+@admin_only
 async def confirm_tags_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """确认标签并发布"""
     query = update.callback_query
     await query.answer()
-    
-    # 解析投稿ID
+
     submission_id = int(query.data.replace("confirm_tags_", ""))
-    selected_tags = context.user_data.get('selected_tags', [])
-    
-    await confirm_and_publish(update, context, submission_id, selected_tags)
+    selected = list(review_state(context.user_data, submission_id).get("selected_tag_ids", []))
+    await confirm_and_publish(update, context, submission_id, selected)
+
+
+async def _publish_to_channel(context, submission, tags: list[str]) -> int | None:
+    html_text, plain_text = build_publish_bodies(
+        submission.text_content,
+        submission.text_html,
+        tags,
+        config.get_footer_text(),
+    )
+    has_media = bool(submission.media_ids) and submission.media_ids not in ("null", "[]")
+    limit = MAX_CAPTION_LENGTH if has_media else MAX_TEXT_LENGTH
+    # Telegram counts visible characters, not the HTML tags around them.
+    extra = None
+    if not plain_text:
+        primary = html_text or None
+    elif len(plain_text) <= limit:
+        primary = html_text or escape_html(plain_text)
+    else:
+        head, rest = clip_text(plain_text, limit)
+        primary = escape_html(head)
+        extra = escape_html(rest) if rest else None
+        logger.info("Clipped channel text for submission %s to %s characters", submission.id, limit)
+
+    if has_media:
+        media_ids = json.loads(submission.media_ids)
+        if submission.media_types:
+            media_types = json.loads(submission.media_types)
+        else:
+            media_types = ["photo"] * len(media_ids)
+        if not media_ids:
+            raise RuntimeError("投稿没有可发布的媒体")
+        messages = await send_media_items(
+            context.bot,
+            config.channel_id,
+            media_ids,
+            media_types,
+            caption=primary,
+            parse_mode=ParseMode.HTML if primary else None,
+        )
+        published_id = messages[0].message_id if messages else None
+    else:
+        message = await context.bot.send_message(
+            chat_id=config.channel_id,
+            text=primary or "（空投稿）",
+            parse_mode=ParseMode.HTML,
+        )
+        published_id = message.message_id
+
+    if extra:
+        try:
+            await context.bot.send_message(
+                chat_id=config.channel_id,
+                text=extra,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception(
+                "Submission %s was published but the overflow text was not",
+                submission.id,
+            )
+    return published_id
 
 
 async def confirm_and_publish(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                              submission_id: int, tags: list):
-    """确认并发布到频道"""
+                              submission_id: int, tag_ids: list):
+    """确认并发布到频道。调用前会再次确认管理员身份。"""
     query = update.callback_query
     user = update.effective_user
-    
-    # 获取投稿信息
-    submission = db.get_submission(submission_id)
-    if not submission:
+
+    if user is None or not await run_blocking(is_operator, user.id):
+        logger.warning(
+            "Blocked non-admin publish of submission %s by %s",
+            submission_id,
+            getattr(user, "id", None),
+        )
+        await _answer_denied(query)
+        return
+
+    if query is None:
+        logger.warning("confirm_and_publish called without a callback query")
+        return
+
+    submission = await run_blocking(db.get_submission, submission_id)
+    if submission is None:
+        clear_review_state(context.user_data, submission_id)
         await query.edit_message_text("❌ 投稿不存在")
         return
-    
-    if submission.status != 'pending':
+
+    if not config.channel_id:
+        await query.edit_message_text("❌ 未配置 channel_id，无法发布")
+        return
+
+    if not await run_blocking(db.claim_submission, submission_id, user.id):
+        clear_review_state(context.user_data, submission_id)
         await query.edit_message_text("❌ 该投稿已被处理")
         return
-    
-    # 发布到频道
-    channel_id = config.channel_id
-    published_msg_id = None
-    
+
+    tags = await _tag_names(tag_ids)
     try:
-        # 构建发布内容（优先使用HTML格式以保留富文本样式）
-        publish_text = ""
-        
-        # 构建标签（格式：#标签：内容）
-        if tags:
-            tag_str = " ".join([f"#{tag}" for tag in tags])
-            publish_text = f"{tag_str}："
-        
-        # 添加投稿内容 - 优先使用HTML格式
-        content_text = submission.text_html if submission.text_html else submission.text_content
-        if content_text:
-            publish_text += content_text
-        
-        # 添加尾部信息
-        footer = config.get_footer_text()
-        if footer:
-            publish_text += f"\n\n{footer}"
-        
-        # 发送到频道（使用 HTML 模式以支持富文本）
-        if submission.media_ids:
-            media_ids = json.loads(submission.media_ids)
-            media_types = json.loads(submission.media_types) if submission.media_types else ['photo'] * len(media_ids)
-            
-            if len(media_ids) == 1:
-                # 单个媒体
-                msg = await send_single_media_to_channel(
-                    context, channel_id, media_ids[0], 
-                    media_types[0], publish_text
-                )
-                published_msg_id = msg.message_id if msg else None
-            else:
-                # 多个媒体
-                msgs = await send_media_group_to_channel(
-                    context, channel_id, media_ids, 
-                    media_types, publish_text
-                )
-                published_msg_id = msgs[0].message_id if msgs else None
-        else:
-            # 纯文字
-            msg = await context.bot.send_message(
-                chat_id=channel_id,
-                text=publish_text,
-                parse_mode=ParseMode.HTML
-            )
-            published_msg_id = msg.message_id
-        
-        # 更新数据库
-        db.approve_submission(submission_id, user.id, tags, published_msg_id)
-        
-        # 增加标签使用次数
-        if tags:
-            db.increment_tag_usage(tags)
-        
-        # 通知管理员
+        published_msg_id = await _publish_to_channel(context, submission, tags)
+    except Exception as exc:
+        logger.exception("Publishing submission %s failed", submission_id)
+        await run_blocking(db.release_submission_claim, submission_id)
         await query.edit_message_text(
-            f"✅ *投稿 #{submission_id} 已通过并发布*\n\n"
-            f"🏷️ 标签: {', '.join(tags) if tags else '无'}\n"
-            f"📢 已发布到: {channel_id}",
-            parse_mode=ParseMode.MARKDOWN
+            f"❌ 发布失败: {escape_html(str(exc))}",
+            parse_mode=ParseMode.HTML,
         )
-        
-        # 通知投稿者
-        try:
-            submitter = db.get_user(submission.user_id)
-            await context.bot.send_message(
-                chat_id=submission.user_id,
-                text=f"🎉 *恭喜！您的投稿 #{submission_id} 已通过审核！*\n\n"
-                     f"您的投稿已发布到 {config.channel_name} 频道。\n"
-                     f"感谢您的投稿！",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except:
-            pass
-    
-    except Exception as e:
-        await query.edit_message_text(f"❌ 发布失败: {str(e)}")
-    
-    # 清除用户状态
-    context.user_data.clear()
+        return
+
+    if published_msg_id is None:
+        logger.error("Channel publish of submission %s produced no message", submission_id)
+        await run_blocking(db.release_submission_claim, submission_id)
+        await query.edit_message_text("❌ 发布失败: 频道没有返回消息")
+        return
+
+    if not await run_blocking(
+        db.finalize_approval, submission_id, user.id, tags, published_msg_id
+    ):
+        logger.error(
+            "Published submission %s as message %s but failed to mark it approved",
+            submission_id,
+            published_msg_id,
+        )
+        await query.edit_message_text("❌ 已发布到频道，但写入审核结果失败，请检查日志")
+        return
+
+    if tags:
+        await run_blocking(db.increment_tag_usage, tags)
+    clear_review_state(context.user_data, submission_id)
+
+    await query.edit_message_text(
+        (
+            f"✅ <b>投稿 #{submission_id} 已通过并发布</b>\n\n"
+            f"🏷️ 标签: {escape_html(', '.join(tags) if tags else '无')}\n"
+            f"📢 已发布到: {escape_html(config.channel_id)}"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=submission.user_id,
+            text=(
+                f"🎉 <b>恭喜！您的投稿 #{submission_id} 已通过审核！</b>\n\n"
+                f"您的投稿已发布到 {escape_html(config.channel_name)} 频道。\n"
+                "感谢您的投稿！"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to notify submitter %s about approval of %s",
+            submission.user_id,
+            submission_id,
+            exc_info=True,
+        )
+    await _mark_review_handled(
+        context,
+        submission_id,
+        user,
+        f"投稿 #{submission_id} 已通过并发布",
+        skip=_current_review_message(update),
+    )
 
 
-async def send_single_media_to_channel(context, channel_id, file_id, 
-                                       media_type, caption=None):
-    """发送单个媒体到频道"""
-    if media_type == 'photo':
-        return await context.bot.send_photo(chat_id=channel_id, photo=file_id, caption=caption, parse_mode=ParseMode.HTML)
-    elif media_type == 'video':
-        return await context.bot.send_video(chat_id=channel_id, video=file_id, caption=caption, parse_mode=ParseMode.HTML)
-    elif media_type == 'audio':
-        return await context.bot.send_audio(chat_id=channel_id, audio=file_id, caption=caption, parse_mode=ParseMode.HTML)
-    elif media_type == 'document':
-        return await context.bot.send_document(chat_id=channel_id, document=file_id, caption=caption, parse_mode=ParseMode.HTML)
-    return None
-
-
-async def send_media_group_to_channel(context, channel_id, file_ids, 
-                                      media_types, caption=None):
-    """发送媒体组到频道"""
-    media = []
-    for i, (file_id, media_type) in enumerate(zip(file_ids, media_types)):
-        cap = caption if i == 0 else None
-        # 使用 HTML 解析模式以支持富文本格式
-        if media_type == 'photo':
-            media.append(InputMediaPhoto(media=file_id, caption=cap, parse_mode=ParseMode.HTML if cap else None))
-        elif media_type == 'video':
-            media.append(InputMediaVideo(media=file_id, caption=cap, parse_mode=ParseMode.HTML if cap else None))
-    
-    if media:
-        return await context.bot.send_media_group(chat_id=channel_id, media=media)
-    return None
-
-
+@admin_only
 async def reject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """拒绝投稿 - 显示拒绝理由"""
     query = update.callback_query
-    user = update.effective_user
-    
-    # 检查权限
-    if not config.is_config_admin(user.id) and not db.is_admin(user.id):
-        await query.answer("❌ 您没有权限执行此操作", show_alert=True)
-        return
-    
     await query.answer()
-    
-    # 解析投稿ID
+
     submission_id = int(query.data.replace("reject_", ""))
-    
-    # 获取拒绝理由列表
-    reasons = db.get_all_reject_reasons()
-    default_reasons = config.default_reject_reasons
-    
-    # 如果数据库没有理由，使用默认理由
+    reasons = await run_blocking(db.get_all_reject_reasons)
     if not reasons:
-        for text in default_reasons:
-            db.add_reject_reason(text)
-        reasons = db.get_all_reject_reasons()
-    
+        for text in config.default_reject_reasons:
+            await run_blocking(db.add_reject_reason, text)
+        reasons = await run_blocking(db.get_all_reject_reasons)
+
     await query.edit_message_reply_markup(
         reply_markup=build_reject_reasons_keyboard(reasons, submission_id)
     )
 
 
+@admin_only
 async def reject_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """选择拒绝理由"""
     query = update.callback_query
-    await query.answer()
-    
-    # 解析数据：reason_submissionId_reasonIndex
-    parts = query.data.split("_")
-    submission_id = int(parts[1])
-    reason_index = int(parts[2])
-    
-    # 获取理由
-    reasons = db.get_all_reject_reasons()
-    if reason_index >= len(reasons):
+    _prefix, submission_raw, reason_raw = query.data.split("_")
+    submission_id = int(submission_raw)
+    reason_id = int(reason_raw)
+
+    reason = await run_blocking(db.get_reject_reason, reason_id)
+    if reason is None:
         await query.answer("理由不存在", show_alert=True)
         return
-    
-    reason = reasons[reason_index]
-    reason_text = reason.text if hasattr(reason, 'text') else reason
-    
-    # 执行拒绝
-    await do_reject(update, context, submission_id, reason_text)
-    
-    # 增加理由使用次数
-    if hasattr(reason, 'id'):
-        db.increment_reason_usage(reason.id)
+
+    await query.answer()
+    if await do_reject(update, context, submission_id, reason.text):
+        await run_blocking(db.increment_reason_usage, reason.id)
 
 
+@admin_only
 async def custom_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """自定义拒绝理由"""
     query = update.callback_query
+    if context.user_data.get("state") == "submitting":
+        await query.answer("请先完成或 /cancel 自己的投稿，再填写拒绝理由", show_alert=True)
+        return
+
     await query.answer()
-    
-    # 解析投稿ID
+
     submission_id = int(query.data.replace("custom_reason_", ""))
-    
-    # 存储状态，等待用户输入
-    context.user_data['awaiting_custom_reason'] = submission_id
-    
+    set_pending_input(context.user_data, "reject_reason", submission_id=submission_id)
     await query.edit_message_text(
         f"📝 请输入拒绝理由（针对投稿 #{submission_id}）：\n\n"
-        f"直接发送文字即可，或发送 /cancel 取消"
+        "直接发送文字即可，或发送 /cancel 取消"
     )
 
 
 async def handle_custom_reason_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理自定义拒绝理由输入"""
+    pending = peek_pending_input(context.user_data, "reject_reason")
+    if not pending:
+        return False
+
     user = update.effective_user
     message = update.message
-    
-    submission_id = context.user_data.get('awaiting_custom_reason')
-    if not submission_id:
-        return False  # 不是在输入自定义理由
-    
-    # 检查权限
-    if not config.is_config_admin(user.id) and not db.is_admin(user.id):
+    if user is None or message is None or not await run_blocking(is_operator, user.id):
         return False
-    
-    reason_text = message.text
-    
-    # 清除状态
-    del context.user_data['awaiting_custom_reason']
-    
-    # 执行拒绝
-    submission = db.get_submission(submission_id)
-    if not submission or submission.status != 'pending':
+
+    if context.user_data.get("state") == "submitting":
+        pop_pending_input(context.user_data, "reject_reason")
+        await message.reply_text(
+            "你正在投稿，已取消未完成的拒绝理由。这条消息会按投稿内容处理。\n"
+            "如需拒绝稿件，请先发送 /cancel 结束投稿。"
+        )
+        return False
+
+    if not message.text or not message.text.strip():
+        await message.reply_text("请发送文字理由，或发送 /cancel 取消")
+        return True
+
+    pop_pending_input(context.user_data, "reject_reason")
+    submission_id = int(pending["submission_id"])
+    reason_text = message.text.strip()
+    result = await commit_rejection(context, user, submission_id, reason_text)
+    if result == "forbidden":
+        return False
+    if result != "ok":
         await message.reply_text("❌ 投稿不存在或已被处理")
         return True
-    
-    db.reject_submission(submission_id, user.id, reason_text)
-    
+
     await message.reply_text(
-        f"❌ *投稿 #{submission_id} 已拒绝*\n\n"
-        f"📝 理由: {reason_text}",
-        parse_mode=ParseMode.MARKDOWN
+        _rejection_admin_text(submission_id, reason_text),
+        parse_mode=ParseMode.HTML,
     )
-    
-    # 通知投稿者
-    try:
-        await context.bot.send_message(
-            chat_id=submission.user_id,
-            text=f"😔 *您的投稿 #{submission_id} 未通过审核*\n\n"
-                 f"📝 原因: {reason_text}\n\n"
-                 f"您可以根据反馈修改后重新投稿。",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except:
-        pass
-    
     return True
 
 
 async def do_reject(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     submission_id: int, reason: str):
-    """执行拒绝操作"""
+    """执行拒绝操作，并再次确认调用者是管理员。"""
     query = update.callback_query
-    user = update.effective_user
-    
-    # 获取投稿
-    submission = db.get_submission(submission_id)
-    if not submission:
-        await query.edit_message_text("❌ 投稿不存在")
-        return
-    
-    if submission.status != 'pending':
-        await query.edit_message_text("❌ 该投稿已被处理")
-        return
-    
-    # 更新数据库
-    db.reject_submission(submission_id, user.id, reason)
-    
-    # 通知管理员
-    await query.edit_message_text(
-        f"❌ *投稿 #{submission_id} 已拒绝*\n\n"
-        f"📝 理由: {reason}",
-        parse_mode=ParseMode.MARKDOWN
+    result = await commit_rejection(
+        context,
+        update.effective_user,
+        submission_id,
+        reason,
+        skip=_current_review_message(update),
     )
-    
-    # 通知投稿者
-    try:
-        await context.bot.send_message(
-            chat_id=submission.user_id,
-            text=f"😔 *您的投稿 #{submission_id} 未通过审核*\n\n"
-                 f"📝 原因: {reason}\n\n"
-                 f"您可以根据反馈修改后重新投稿。",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except:
-        pass
+    if result == "forbidden":
+        await _answer_denied(query)
+        return False
+    if query is None:
+        return result == "ok"
+    if result != "ok":
+        await query.edit_message_text("❌ 投稿不存在或已被处理")
+        return False
+    await query.edit_message_text(
+        _rejection_admin_text(submission_id, reason),
+        parse_mode=ParseMode.HTML,
+    )
+    return True
 
 
+@admin_only
 async def back_to_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """返回审核界面"""
     query = update.callback_query
     await query.answer()
-    
-    # 解析投稿ID
+
     submission_id = int(query.data.replace("back_review_", ""))
-    
-    # 清除选中的标签
-    context.user_data['selected_tags'] = []
-    
-    # 显示审核按钮
-    await query.edit_message_reply_markup(
-        reply_markup=build_review_keyboard(submission_id)
-    )
+    state = review_state(context.user_data, submission_id)
+    state["selected_tag_ids"] = []
+    await query.edit_message_reply_markup(reply_markup=build_review_keyboard(submission_id))
